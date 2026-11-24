@@ -62,6 +62,9 @@ class Planner:
         self.csr = csr_matrix((a_cost, (rg.arc_from, rg.arc_to)), shape=(rg.n_nodes, rg.n_nodes))
         self.proj = Projector(*rg.center)
         self.node_xy = self.proj.xy(rg.node_lat, rg.node_lon)
+        # one-way routes: length of the most direct start -> finish leg found by the last plan()
+        # (None if the finish could not be reached), so callers can explain an empty result
+        self.direct_m: float | None = None
 
     # -- helpers ---------------------------------------------------------------
 
@@ -131,6 +134,15 @@ class Planner:
         pool = [pts[i] for i in ok_idx if pts[i] not in (start, end)]
 
         budget = o.distance_m * (1 + o.tolerance)
+        self.direct_m = None
+        if end != start:
+            # a one-way route has to cover the start -> finish leg itself
+            direct = self._leg(start, end)
+            if direct is None:
+                return []
+            self.direct_m = direct[2]
+            if direct[2] > budget:
+                return []
         found: list[Plan] = []
         n_restarts = o.restarts * (1 if alternatives == 1 else 2)
         for r in range(n_restarts):
@@ -215,16 +227,14 @@ class Planner:
 
     def _construct(self, start, end, pool, budget, greedy_k, tour=None):
         cnt = np.zeros(len(self.new_len), dtype=np.int32)
-        if tour is None:
-            tour = [start, end]
-            total = 0.0
-        else:
-            tour = list(tour)
-            total = 0.0
-            for a, b in zip(tour[:-1], tour[1:]):
-                leg = self._leg(a, b)
-                np.add.at(cnt, leg[0], 1)
-                total += leg[2]
+        tour = [start, end] if tour is None else list(tour)
+        total = 0.0
+        # count the legs the tour already has: for a one-way route that includes the direct
+        # start -> finish leg, which would otherwise ride along unbudgeted
+        for a, b in zip(tour[:-1], tour[1:]):
+            leg = self._leg(a, b)
+            np.add.at(cnt, leg[0], 1)
+            total += leg[2]
         in_tour = set(tour[1:-1])
         while True:
             options = []
