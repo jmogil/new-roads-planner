@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>New Roads Planner</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M4 11.5 12 4.5l8 7"/><path d="M6.5 10v9.5h11V10"/></symbol>
+  <symbol id="i-locate" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6.5"/><circle cx="12" cy="12" r="2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3"/></symbol>
+  <symbol id="i-swap" viewBox="0 0 24 24"><path d="M8 4v16M8 4 4.5 7.5M8 4l3.5 3.5M16 20V4M16 20l-3.5-3.5M16 20l3.5-3.5"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19.5h14"/></symbol>
+</svg>
+
+<div class="app">
+  <aside class="panel">
+    <header class="brand">
+      <img src="favicon.svg" alt="" width="36" height="36">
+      <div>
+        <h1>New Roads Planner</h1>
+        <p>Rides and runs on roads you've never been on</p>
+      </div>
+    </header>
+
+    <p id="status" class="status" role="status">Connecting to the planner…</p>
+
+    <form id="plan-form" novalidate>
+      <fieldset class="field">
+        <legend>Activity</legend>
+        <div class="segmented">
+          <label><input type="radio" name="mode" value="ride" checked><span>Ride<small>bike network</small></span></label>
+          <label><input type="radio" name="mode" value="run"><span>Run<small>foot network</small></span></label>
+        </div>
+      </fieldset>
+
+      <fieldset class="field">
+        <legend>Route</legend>
+        <div class="segmented">
+          <label><input type="radio" name="routeType" value="loop" checked><span>Loop<small>back to the start</small></span></label>
+          <label><input type="radio" name="routeType" value="oneway"><span>A → B<small>finish somewhere else</small></span></label>
+        </div>
+      </fieldset>
+
+      <fieldset class="field place">
+        <legend><span class="dot dot-start" aria-hidden="true"></span>Start</legend>
+        <div class="search">
+          <input type="search" id="start-q" placeholder="Search for a place or address" autocomplete="off" aria-label="Search for a start">
+          <button type="button" class="icon-btn" data-search="start" title="Search"><svg class="i"><use href="#i-search"/></svg></button>
+        </div>
+        <ul class="search-results" id="start-results" hidden></ul>
+        <div class="chips">
+          <button type="button" class="chip" data-pick="start" aria-pressed="false"><svg class="i"><use href="#i-pin"/></svg>Pick on map</button>
+          <button type="button" class="chip" id="usual-start"><svg class="i"><use href="#i-home"/></svg>Usual start</button>
+          <button type="button" class="chip" id="locate"><svg class="i"><use href="#i-locate"/></svg>My location</button>
+        </div>
+        <p class="place-label" id="start-label"></p>
+      </fieldset>
+
+      <fieldset class="field place" id="end-field" hidden>
+        <legend><span class="dot dot-end" aria-hidden="true"></span>Finish</legend>
+        <div class="search">
+          <input type="search" id="end-q" placeholder="Search for a place or address" autocomplete="off" aria-label="Search for a finish">
+          <button type="button" class="icon-btn" data-search="end" title="Search"><svg class="i"><use href="#i-search"/></svg></button>
+        </div>
+        <ul class="search-results" id="end-results" hidden></ul>
+        <div class="chips">
+          <button type="button" class="chip" data-pick="end" aria-pressed="false"><svg class="i"><use href="#i-pin"/></svg>Pick on map</button>
+          <button type="button" class="chip" id="swap"><svg class="i"><use href="#i-swap"/></svg>Swap start and finish</button>
+        </div>
+        <p class="place-label" id="end-label"></p>
+      </fieldset>
+
+      <fieldset class="field">
+        <legend>Distance</legend>
+        <div class="distance">
+          <input type="range" id="distance-range" aria-label="Distance">
+          <label class="distance-num"><input type="number" id="distance" min="0.5" max="400" step="0.5" inputmode="decimal" aria-label="Distance in km"><span>km</span></label>
+        </div>
+        <p class="hint" id="distance-hint"></p>
+        <p class="hint" id="area-hint" hidden></p>
+      </fieldset>
+
+      <details class="advanced" id="advanced">
+        <summary>More options</summary>
+        <div class="opt">
+          <span class="opt-title">Routes to suggest</span>
+          <div class="segmented small">
+            <label><input type="radio" name="alternatives" value="1"><span>1</span></label>
+            <label><input type="radio" name="alternatives" value="2"><span>2</span></label>
+            <label><input type="radio" name="alternatives" value="3" checked><span>3</span></label>
+          </div>
+          <p class="opt-help">Extra suggestions share less than half their roads with each other. More take longer.</p>
+        </div>
+        <div class="opt">
+          <span class="opt-title">Main roads</span>
+          <div class="segmented small">
+            <label><input type="radio" name="avoidMain" value="0"><span>Don't mind</span></label>
+            <label><input type="radio" name="avoidMain" value="1" checked><span>Avoid</span></label>
+            <label><input type="radio" name="avoidMain" value="2"><span>Avoid strongly</span></label>
+          </div>
+        </div>
+        <div class="opt">
+          <label class="opt-title" for="eagerness">Chase new roads <output id="eagerness-value"></output></label>
+          <input type="range" id="eagerness" min="0" max="0.95" step="0.05">
+          <p class="opt-help">How far the links between new areas detour onto new streets. Higher finds more new road but zig-zags more.</p>
+        </div>
+        <div class="opt">
+          <span class="opt-title">Search effort</span>
+          <div class="segmented small">
+            <label><input type="radio" name="effort" value="quick"><span>Quick</span></label>
+            <label><input type="radio" name="effort" value="normal" checked><span>Normal</span></label>
+            <label><input type="radio" name="effort" value="thorough"><span>Thorough</span></label>
+          </div>
+        </div>
+        <div class="opt">
+          <label class="check"><input type="checkbox" id="count-all"><span>Count roads from every activity type as done</span></label>
+          <p class="opt-help">For example, a road you've run counts as done for rides too.</p>
+        </div>
+      </details>
+
+      <button type="submit" class="primary" id="generate" disabled>Generate routes</button>
+      <p class="form-error" id="form-error" role="alert" hidden></p>
+    </form>
+
+    <section class="progress" id="progress" hidden aria-live="polite">
+      <div class="progress-head">
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="progress-text">Starting…</span>
+        <span class="progress-time" id="progress-time"></span>
+      </div>
+      <details>
+        <summary>Details</summary>
+        <pre class="progress-log" id="progress-log"></pre>
+      </details>
+    </section>
+
+    <section class="results" id="results" hidden>
+      <h2>Suggested routes</h2>
+      <p class="results-summary" id="results-summary"></p>
+      <p class="hint warn" id="results-stale" hidden>You've changed the settings since these were made. Generate again to update them.</p>
+      <ul class="route-list" id="route-list"></ul>
+      <p class="hint">Generate again for different suggestions. Each search starts fresh.</p>
+    </section>
+
+    <footer class="foot">
+      Road and map data © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>.
+      Your activities never leave this computer.
+    </footer>
+  </aside>
+
+  <main class="map-wrap">
+    <div id="map" aria-label="Map"></div>
+    <div class="pick-banner" id="pick-banner" hidden>
+      <span id="pick-banner-text"></span>
+      <button type="button" id="pick-cancel">Cancel</button>
+    </div>
+    <details class="legend" id="legend" open>
+      <summary>Map key</summary>
+      <div class="legend-row"><span class="swatch new"></span>Route: new road</div>
+      <div class="legend-row"><span class="swatch done"></span>Route: done before</div>
+      <div class="legend-row"><span class="swatch alt"></span>Other suggestions</div>
+      <label class="legend-row"><input type="checkbox" id="show-untraveled" checked><span class="swatch untraveled"></span>Other new roads nearby</label>
+      <label class="legend-row"><input type="checkbox" id="show-traveled"><span class="swatch traveled"></span>Roads you've done</label>
+      <label class="legend-row"><input type="checkbox" id="show-areas" checked><span class="swatch area"></span>Road data downloaded</label>
+    </details>
+  </main>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="app.js"></script>
+</body>
+</html>
