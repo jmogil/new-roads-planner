@@ -4,6 +4,14 @@ Where the project is and where it could go next. Nothing here is a commitment. I
 choose from, roughly in order of value for effort within each section. See the
 [changelog](../CHANGELOG.md) for what's already been done.
 
+Each item has a [GitHub issue](https://github.com/jmogil/new-roads-planner/issues) with the
+details, a "done when" checklist and where to start in the code. Work is tracked and discussed
+there. The issues are labelled by area:
+[web app](https://github.com/jmogil/new-roads-planner/labels/web%20app),
+[planner](https://github.com/jmogil/new-roads-planner/labels/planner),
+[data](https://github.com/jmogil/new-roads-planner/labels/data) and
+[hosting](https://github.com/jmogil/new-roads-planner/labels/hosting).
+
 ## Done
 
 - **v0.1, command-line prototype.** Strava bulk-export parsing, OpenStreetMap road download,
@@ -14,46 +22,66 @@ choose from, roughly in order of value for effort within each section. See the
   and download GPX. Also: a shared pipeline for both front ends, the export path remembered,
   a fix for one-way routes overshooting the distance, and the first automated tests.
 
+## Known problems
+
+- **Two processes downloading the same new area at once can corrupt it**
+  ([#8](https://github.com/jmogil/new-roads-planner/issues/8)), for example the command line
+  and the web app starting the same new area together. A lock per area would fix it. Until
+  then, let one finish first.
+
 ## Next: web app
 
-- **Cancel a running search.** Downloads can take a while. A cancel button needs the download
-  loop and the search to check a stop flag between tiles or restarts.
-- **Direction and distance markers** on the route: arrows, and a marker every 5 or 10 km. For
-  loops, a **reverse direction** button (one-way streets permitting on rides).
-- **Download progress as a percentage**, and an estimate before starting ("about 25 tiles").
-- **Saved routes.** Keep routes you like with a name and date, and mark routes as done.
-- **Don't suggest the same thing twice.** Penalise roads in recently suggested routes, so
-  "generate again" explores further.
-- **Via points and areas to avoid.** Click to add a "go through here" point, or draw an area
-  to keep out of.
-- **Elevation profile** for the chosen route, once elevation data is in (see below).
-- **Guard against two processes downloading the same area at once**, for example the command
-  line and the web app. A lock file per tile would do it.
+- **Cancel a running search** ([#1](https://github.com/jmogil/new-roads-planner/issues/1)).
+  Downloads can take a while. A cancel button needs the download loop and the search to check
+  a stop flag between tiles or restarts.
+- **Direction and distance markers** on the route
+  ([#2](https://github.com/jmogil/new-roads-planner/issues/2)): arrows, and a marker every
+  5 km or 1 km. For loops, a reverse direction button (one-way streets permitting on rides).
+- **Download progress as a percentage**, and an estimate before starting ("about 25 parts")
+  ([#3](https://github.com/jmogil/new-roads-planner/issues/3)).
+- **Saved routes** ([#4](https://github.com/jmogil/new-roads-planner/issues/4)). Keep routes
+  you like with a name and date, and mark routes as done.
+- **Don't suggest the same thing twice**
+  ([#5](https://github.com/jmogil/new-roads-planner/issues/5)). Steer away from roads in
+  recent suggestions, so "generate again" explores further.
+- **Via points and areas to avoid** ([#6](https://github.com/jmogil/new-roads-planner/issues/6)).
+  Click to add a "go through here" point, or draw an area to keep out of.
+- **Elevation profile** for the chosen route
+  ([#7](https://github.com/jmogil/new-roads-planner/issues/7)), once elevation data is in
+  (see #11 below).
 
 ## Next: planner
 
-- **Paved-only option** for road bikes, using OSM `surface` and `tracktype` tags.
-- **Directional mode,** so a road ridden in the other direction counts as new.
-- **Elevation-aware routing:** avoid or seek climbs, and report total ascent.
-- **A better fallback when the finish is barely reachable.** Today, if the cheapest-by-preference
-  path to the finish is over budget, the planner gives up, even when the plain shortest path
-  would fit.
-- **Time budgets** ("a 90-minute ride") using a typical speed per activity.
+- **Paved-only option** for road bikes, using OSM `surface` and `tracktype` tags
+  ([#9](https://github.com/jmogil/new-roads-planner/issues/9)).
+- **Directional mode,** so a road ridden in the other direction counts as new
+  ([#10](https://github.com/jmogil/new-roads-planner/issues/10)).
+- **Elevation-aware routing:** avoid or seek climbs, and report total ascent
+  ([#11](https://github.com/jmogil/new-roads-planner/issues/11)).
+- **A better fallback when the finish is barely reachable**
+  ([#12](https://github.com/jmogil/new-roads-planner/issues/12)). Today, if the
+  cheapest-by-preference path to the finish is over budget, the planner gives up, even when
+  the plain shortest path would fit.
+- **Time budgets** ("a 90-minute ride") using a typical speed per activity
+  ([#13](https://github.com/jmogil/new-roads-planner/issues/13)).
 - **Surface and road-type preferences** beyond "avoid main roads", such as preferring bike
-  paths or avoiding gravel.
+  paths or avoiding gravel ([#14](https://github.com/jmogil/new-roads-planner/issues/14)).
 
 ## Next: data
 
-- **Sync from the Strava API** instead of re-exporting. This needs an API application and
-  OAuth, and has to stay within Strava's terms for personal use.
+- **Sync from the Strava API** instead of re-exporting
+  ([#15](https://github.com/jmogil/new-roads-planner/issues/15)). This needs an API
+  application and OAuth, and has to stay within Strava's terms for personal use.
 - **Other sources:** a folder of GPX/FIT files (Garmin, Wahoo, Coros), or a Garmin Connect
-  export.
-- **Wandrer-style stats:** % of each suburb or town done, and progress over time.
+  export ([#16](https://github.com/jmogil/new-roads-planner/issues/16)).
+- **Wandrer-style stats:** % of each suburb or town done, and progress over time
+  ([#17](https://github.com/jmogil/new-roads-planner/issues/17)).
 
 ## Later: a hosted version
 
 Running on your own computer keeps everything private and simple, but it means having a
-computer running. A hosted version (a phone-friendly site, or an app) would need:
+computer running. A hosted version (a phone-friendly site, or an app) would need the following.
+It's being worked through in [#18](https://github.com/jmogil/new-roads-planner/issues/18).
 
 - **Somewhere to run the planner.** It needs a few hundred MB of memory per area and tens of
   seconds of CPU per search, so a small server or serverless jobs with a cache of road graphs.
@@ -64,12 +92,14 @@ computer running. A hosted version (a phone-friendly site, or an app) would need
 - **OpenStreetMap usage policies:** the public Overpass, Nominatim and tile servers aren't meant
   for a busy service, so it would need its own extracts or paid providers.
 
-A lighter step first: package the local app so it starts with a double-click, and use
-`--host 0.0.0.0` (already supported) for phones on the home network.
+A lighter step first: package the local app so it starts with a double-click
+([#19](https://github.com/jmogil/new-roads-planner/issues/19)), and use `--host 0.0.0.0`
+(already supported) for phones on the home network.
 
 ## Open questions
 
 - Should "new" have a time limit, so roads you haven't been on for, say, five years count as new
-  again?
+  again? ([#20](https://github.com/jmogil/new-roads-planner/issues/20))
 - Should the planner use a stricter or looser GPS matching distance than 20 m in dense CBD
   streets, where parallel roads are close together?
+  ([#21](https://github.com/jmogil/new-roads-planner/issues/21))

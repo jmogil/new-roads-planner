@@ -216,7 +216,8 @@ parsed.
   terminal. Use that one, or start another with `--port 8766`.
 - **Don't download the same new area from both tools at once.** For example, don't run a
   command-line route and a web app route for the same new area at the same time: both would
-  write the same download files. Once an area is downloaded, using both is fine.
+  write the same download files. Once an area is downloaded, using both is fine. A proper fix
+  is tracked in [#8](https://github.com/jmogil/new-roads-planner/issues/8).
 - **To force a rebuild**: delete `cache/graph_*.pkl` to rebuild graphs from the saved `.osm`
   files, or delete the whole `cache/` folder to start from scratch.
 
