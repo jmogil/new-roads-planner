@@ -116,17 +116,24 @@ def _cache_name(mode, lat, lon, radius_m):
     return f"graph_{mode}_{lat:.4f}_{lon:.4f}_{int(radius_m)}.pkl"
 
 
-def find_cached_graph(cache_dir, mode, lat, lon, radius_m) -> str | None:
-    """Return a cached graph file whose circle fully contains the requested circle."""
-    for path in glob.glob(os.path.join(cache_dir, f"graph_{mode}_*.pkl")):
+def cached_areas(cache_dir, mode=None) -> list[dict]:
+    """Areas with a road graph ready in the cache: [{"mode", "lat", "lon", "radius_m", "path"}]."""
+    out = []
+    for path in glob.glob(os.path.join(cache_dir, f"graph_{mode or '*'}_*.pkl")):
         try:
-            _, _, clat, clon, crad = os.path.basename(path)[:-4].split("_")
-            d = haversine_m(lat, lon, float(clat), float(clon))
-            if d + radius_m <= float(crad):
-                return path
+            _, m, clat, clon, crad = os.path.basename(path)[:-4].split("_")
+            out.append({"mode": m, "lat": float(clat), "lon": float(clon), "radius_m": float(crad),
+                        "path": path})
         except ValueError:
             continue
-    return None
+    return out
+
+
+def find_cached_graph(cache_dir, mode, lat, lon, radius_m) -> str | None:
+    """Return the smallest cached graph file whose circle fully contains the requested circle."""
+    fits = [a for a in cached_areas(cache_dir, mode)
+            if haversine_m(lat, lon, a["lat"], a["lon"]) + radius_m <= a["radius_m"]]
+    return min(fits, key=lambda a: a["radius_m"])["path"] if fits else None
 
 
 def load_graph(cache_dir: str, mode: str, lat: float, lon: float, radius_m: float) -> RoadGraph:
@@ -152,8 +159,10 @@ def load_graph(cache_dir: str, mode: str, lat: float, lon: float, radius_m: floa
     rg = _graph_to_arrays(G, mode, (lat, lon), radius_m, net["penalty"])
     # the raw .osm file is kept so the graph can be rebuilt without re-downloading
     # (delete cache/graph_*.pkl to force a rebuild)
-    with open(os.path.join(cache_dir, _cache_name(mode, lat, lon, radius_m)), "wb") as fh:
+    path = os.path.join(cache_dir, _cache_name(mode, lat, lon, radius_m))
+    with open(path + ".part", "wb") as fh:  # write-then-rename, so an interrupted save can't leave a broken cache
         pickle.dump(rg, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(path + ".part", path)
     return rg
 
 
@@ -258,20 +267,32 @@ def _overpass_fetch(query: str, out_path: str):
     raise RuntimeError("Could not download OpenStreetMap data from Overpass (try again later).")
 
 
-def geocode(address: str) -> tuple[float, float]:
-    """Look up an address with OSM Nominatim (via curl, see _download_osm)."""
+def search_places(query: str, limit: int = 5, viewbox=None) -> list[dict]:
+    """Look up places with OSM Nominatim (via curl, see _download_osm).
+
+    viewbox = (west, north, east, south) prefers results in that area without
+    excluding others. Returns [{"name", "lat", "lon"}], best match first.
+    """
     import json
     import subprocess
 
-    res = subprocess.run(
-        ["curl", "-sS", "-G", "-A", USER_AGENT, "https://nominatim.openstreetmap.org/search",
-         "--data-urlencode", f"q={address}", "--data-urlencode", "format=json",
-         "--data-urlencode", "limit=1"],
-        capture_output=True, text=True, check=True)
-    hits = json.loads(res.stdout)
+    cmd = ["curl", "-sS", "-G", "--fail", "--max-time", "20", "-A", USER_AGENT,
+           "https://nominatim.openstreetmap.org/search",
+           "--data-urlencode", f"q={query}", "--data-urlencode", "format=json",
+           "--data-urlencode", f"limit={int(limit)}"]
+    if viewbox:
+        cmd += ["--data-urlencode", "viewbox=" + ",".join(f"{float(v):.5f}" for v in viewbox)]
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return [{"name": h.get("display_name", ""), "lat": float(h["lat"]), "lon": float(h["lon"])}
+            for h in json.loads(res.stdout)]
+
+
+def geocode(address: str) -> tuple[float, float]:
+    """Look up an address with OSM Nominatim."""
+    hits = search_places(address, limit=1)
     if not hits:
         raise SystemExit(f"Address not found: {address}")
-    return float(hits[0]["lat"]), float(hits[0]["lon"])
+    return hits[0]["lat"], hits[0]["lon"]
 
 
 def _graph_to_arrays(G, mode, center, radius_m, pen_table) -> RoadGraph:
@@ -427,5 +448,7 @@ def compute_coverage(rg: RoadGraph, tracks, cache_dir: str) -> np.ndarray:
     frac = np.divide(n_hit, n_tot, out=np.zeros(len(rg.edge_len)), where=n_tot > 0)
     # snap GPS noise: mostly-done counts as done, a couple of stray hits counts as new
     frac = np.where(frac >= 0.85, 1.0, np.where(frac <= 0.15, 0.0, frac))
-    np.save(path, frac)
+    with open(path + ".part", "wb") as fh:
+        np.save(fh, frac)
+    os.replace(path + ".part", path)
     return frac

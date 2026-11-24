@@ -27,7 +27,40 @@ def route_coords(rg: RoadGraph, plan: Plan) -> np.ndarray:
     return np.concatenate(out) if out else np.zeros((0, 2))
 
 
-def write_gpx(path: str, rg: RoadGraph, plan: Plan, name: str):
+def route_segments(rg: RoadGraph, plan: Plan, new_len: np.ndarray, decimals: int = 5) -> list[dict]:
+    """The route as consecutive runs of new / already-traveled road, for drawing on a map.
+
+    [{"new": bool, "coords": [[lat, lon], ...]}, ...]; each run starts where the last one ended.
+    """
+    runs: list[dict] = []
+    for coords, is_new in route_pieces(rg, plan, new_len):
+        latlon = np.round(coords[:, ::-1], decimals).tolist()
+        if runs and runs[-1]["new"] == bool(is_new):
+            runs[-1]["coords"].extend(latlon[1:])
+        else:
+            runs.append({"new": bool(is_new), "coords": latlon})
+    return runs
+
+
+def nearby_roads(rg: RoadGraph, new_len: np.ndarray, bounds, decimals: int = 5) -> dict:
+    """Roads with their midpoint inside bounds = ((south, west), (north, east)).
+
+    Returns {"untraveled": [...], "traveled": [...]}, each a list of [[lat, lon], ...] lines.
+    Separately-mapped sidewalks and crossings are left out, as they aren't roads to collect.
+    """
+    (s, w), (n, e) = bounds
+    mid_lon = (rg.node_lon[rg.edge_u] + rg.node_lon[rg.edge_v]) / 2
+    mid_lat = (rg.node_lat[rg.edge_u] + rg.node_lat[rg.edge_v]) / 2
+    near = (mid_lon > w) & (mid_lon < e) & (mid_lat > s) & (mid_lat < n) & rg.edge_target
+    new = new_len > 0.5 * rg.edge_len
+
+    def lines(ids):
+        return [np.round(rg.edge_coords(int(i))[:, ::-1], decimals).tolist() for i in ids]
+
+    return {"untraveled": lines(np.where(near & new)[0]), "traveled": lines(np.where(near & ~new)[0])}
+
+
+def gpx_xml(rg: RoadGraph, plan: Plan, name: str) -> str:
     import gpxpy.gpx
 
     gpx = gpxpy.gpx.GPX()
@@ -39,8 +72,12 @@ def write_gpx(path: str, rg: RoadGraph, plan: Plan, name: str):
                                                   longitude=round(float(lon), 6)))
     trk.segments.append(seg)
     gpx.tracks.append(trk)
+    return gpx.to_xml()
+
+
+def write_gpx(path: str, rg: RoadGraph, plan: Plan, name: str):
     with open(path, "w") as fh:
-        fh.write(gpx.to_xml())
+        fh.write(gpx_xml(rg, plan, name))
 
 
 def _lines_geojson(rg: RoadGraph, edge_ids) -> dict:
