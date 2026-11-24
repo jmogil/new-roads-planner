@@ -1,0 +1,22 @@
+# Personal data - never commit these
+cache/
+output/
+export_*/
+export_*.zip
+*.fit
+*.fit.gz
+*.gpx
+*.tcx
+*.tcx.gz
+*.osm
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
