@@ -196,7 +196,7 @@ def parse_route_request(body: dict) -> pipeline.RouteRequest:
         try:
             lat, lon = float(value["lat"]), float(value["lon"])
         except (TypeError, KeyError, ValueError):
-            raise ApiError(400, f'The {label} should look like {{"lat": -27.47, "lon": 153.02}}.')
+            raise ApiError(400, f'The {label} should look like {{"lat": 51.5007, "lon": -0.1246}}.')
         if not (math.isfinite(lat) and math.isfinite(lon)):
             raise ApiError(400, f"The {label} isn't a valid latitude/longitude.")
         return lat, lon
@@ -396,19 +396,14 @@ class Handler(BaseHTTPRequestHandler):
     # -- safety: answer only pages served from this computer --------------------------
 
     def _check_host(self):
-        allowed = self.server.allowed_hosts
-        if allowed is None:  # listening on every interface, by request
-            return
         host = (self.headers.get("Host") or "").strip().lower()
         name = host[:host.find("]") + 1] if host.startswith("[") else host.split(":")[0]
-        if name not in allowed:  # e.g. DNS rebinding from a web page
+        allowed = self.server.allowed_hosts  # None when listening on every interface, by request
+        if allowed is not None and name not in allowed:  # e.g. DNS rebinding from a web page
             raise ApiError(403, "Unexpected Host header.")
-        origin = self.headers.get("Origin")
-        if origin and origin != "null":
-            o = urlparse(origin).netloc.lower()
-            o_name = o[:o.find("]") + 1] if o.startswith("[") else o.split(":")[0]
-            if o_name not in allowed:
-                raise ApiError(403, "Requests from other websites aren't allowed.")
+        origin = self.headers.get("Origin")  # browsers send it on cross-site requests
+        if origin and urlparse(origin).netloc.lower() != host:
+            raise ApiError(403, "Requests from other websites aren't allowed.")
 
     def _read_json(self) -> dict:
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()

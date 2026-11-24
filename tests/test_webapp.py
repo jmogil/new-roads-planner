@@ -151,6 +151,10 @@ class WebAppTests(unittest.TestCase):
         status, _, _ = self.request("POST", "/api/plan", {"start": self.point(1, 1)},
                                     {"Origin": "https://evil.example"})
         self.assertEqual(status, 403)
+        status, _, _ = self.request("POST", "/api/plan", {"start": self.point(1, 1)}, {"Origin": "null"})
+        self.assertEqual(status, 403)  # e.g. a sandboxed frame or a local file
+        status, _, _ = self.request("GET", "/api/config", headers={"Origin": f"http://127.0.0.1:{self.port}"})
+        self.assertEqual(status, 200)  # the planner's own page
 
     def test_static_files(self):
         status, headers, body = self.request("GET", "/")

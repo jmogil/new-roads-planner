@@ -26,6 +26,7 @@ const state = {
   config: null,                 // from /api/config
   pick: null,                   // "start" | "end" while the next map click sets it
   job: null,                    // id of the search in progress
+  lastJob: null,                // id of the latest search, to show its routes again after a reload
   result: null,                 // the finished search
   selected: 0,                  // which suggested route is highlighted
 };
@@ -33,9 +34,9 @@ const state = {
 // ---------- saving settings between visits (this browser only) ----------
 
 function save() {
-  const { mode, routeType, distance, start, end, options, show } = state;
+  const { mode, routeType, distance, start, end, options, show, lastJob } = state;
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify({ mode, routeType, distance, start, end, options, show }));
+    localStorage.setItem(STORE_KEY, JSON.stringify({ mode, routeType, distance, start, end, options, show, lastJob }));
   } catch (_) { /* storage unavailable: settings just aren't remembered */ }
 }
 
@@ -58,6 +59,7 @@ function restore() {
   if (["quick", "normal", "thorough"].includes(o.effort)) state.options.effort = o.effort;
   state.options.countAll = o.countAll === true;
   for (const k in state.show) if (typeof (s.show || {})[k] === "boolean") state.show[k] = s.show[k];
+  if (typeof s.lastJob === "string" && /^[0-9a-f]{12}$/.test(s.lastJob)) state.lastJob = s.lastJob;
 }
 
 function isPlace(p) {
@@ -268,7 +270,7 @@ async function search(which) {
   }
 }
 
-// "Brisbane City Hall, 64, Adelaide Street, Brisbane City, ..." -> "Brisbane City Hall, Adelaide Street"
+// "Town Hall, 12, High Street, Springfield, ..." -> "Town Hall, High Street"
 function shortName(name) {
   const parts = name.split(",").map((s) => s.trim()).filter((s) => s && !/^\d+[a-z]?$/i.test(s));
   return parts.slice(0, 2).join(", ") || name;
@@ -447,6 +449,8 @@ async function generate(e) {
   showProgress({ status: "queued", log: [], elapsed_s: 0 });
   try {
     const { job } = await api("/api/plan", { method: "POST", body });
+    state.lastJob = job;
+    save();
     follow(job);
   } catch (err) {
     state.job = null;
@@ -758,9 +762,29 @@ async function init() {
   }
   initialView();
   updateHints();
-  if (state.config.active_job) { // e.g. the page was reloaded during a long download
-    showProgress({ status: "running", log: [], elapsed_s: 0 });
-    follow(state.config.active_job);
+  resume();
+}
+
+// after a reload: follow a search that's still running (say, a long download), or show the
+// routes from the latest one while webapp.py still has them
+async function resume() {
+  const id = state.config.active_job || state.lastJob;
+  if (!id) return;
+  let s;
+  try {
+    s = await api(`/api/jobs/${id}`);
+  } catch (_) { // expired, or webapp.py was restarted
+    state.lastJob = null;
+    save();
+    return;
+  }
+  if (s.status === "done") {
+    const r = s.result;
+    showResult(r);
+    if (r.mode !== state.mode || r.route_type !== state.routeType || r.distance_km !== state.distance[state.mode]) markStale();
+  } else if (s.status === "queued" || s.status === "running") {
+    showProgress(s);
+    follow(id);
   }
 }
 
