@@ -67,8 +67,21 @@ Your browser opens the planner at <http://127.0.0.1:8765>. Then:
 4. Set the **distance**, then click **Generate routes**.
 
 You get up to three different suggestions. Red is new road, blue is road you've done before,
-and dashed orange shows other untraveled roads nearby. Click a suggestion to see it, then
-**GPX** to download it.
+and dashed orange shows other untraveled roads nearby. Arrows and km markers along the route
+show the way round, and an elevation profile shows the climbs. Click a suggestion to see it,
+then:
+
+- **GPX** downloads it, with elevations.
+- **Save** keeps it in your saved routes, where you can rename it and mark it done.
+- **Reverse** turns a loop around.
+
+You also get:
+
+- A warning before you start when an area's road data needs downloading, with how long it
+  should take.
+- A progress bar, with a **Cancel** button, while it works.
+- **Clear**, to start over.
+- A **Map / Aerial** switch for aerial photos.
 
 The export path is remembered, so from then on this is enough:
 
@@ -172,10 +185,12 @@ parsed.
    - Separately-mapped sidewalks and crossings can be used to get around, but they don't count
      as new roads.
 4. **Pipeline** (`pipeline.py`): ties those steps together for one route request, and keeps
-   activities and road graphs in memory between requests.
+   activities and road graphs in memory between requests. `progress.py` lets the slow steps
+   report progress and be cancelled.
 5. **Output**: `export.py` writes the GPX, HTML map and JSON summary for the command line
    (`newroutes.py`). The web app (`webapp.py` plus the page in `web/`) draws routes on a
-   [Leaflet](https://leafletjs.com) map and serves GPX downloads.
+   [Leaflet](https://leafletjs.com) map and serves GPX downloads. It also adds elevation
+   profiles (`elevation.py`, from SRTM data) and keeps saved routes (`saved.py`).
 
 [docs/architecture.md](docs/architecture.md) goes into more detail, including the web app's API.
 
@@ -194,14 +209,19 @@ parsed.
 - **An A → B route needs room for detours.** The finish has to be well within the distance
   (as a rule of thumb, the distance should be at least 1.5 times the straight line between start
   and finish) for the route to collect much new road.
+- **Elevation is approximate.** It comes from the SRTM survey, about a 30 m grid that includes
+  trees and buildings. It's good for a profile and a climbing estimate, not exact heights.
 - **Privacy:** your activity files stay on your computer, and `cache/` and `output/` are
-  git-ignored. Some lookups do go out:
+  git-ignored, as are the web app's saved routes (`cache/saved_routes/`). Some lookups do go
+  out:
   - Road data comes from the public Overpass API (with two community mirrors as fallback),
     using a bounding box around your start point.
   - Place searches (`--start-address`, or the web app's search boxes) go to OSM Nominatim. The
     web app also sends the area the map is showing, so nearby matches come first.
-  - The web app's map tiles come from OpenStreetMap's tile servers, and the page loads the
-    Leaflet map library from unpkg.com.
+  - Elevation data comes from the AWS Terrain Tiles open dataset, one 1° × 1° square (about
+    110 km across) at a time. Only the square's name is sent, never a route.
+  - The web app's map tiles come from OpenStreetMap's tile servers, and its aerial photos from
+    Esri. The page loads the Leaflet map library from unpkg.com.
 
 ## Troubleshooting
 
@@ -226,8 +246,8 @@ parsed.
 .venv/bin/python -m unittest discover tests
 ```
 
-The tests run the planner and the web app's API on a synthetic street grid, so they need no
-Strava data or downloads. The [changelog](CHANGELOG.md) lists what's changed, and the
+The tests run the planner, the download lock, elevation and the web app's API on a synthetic
+street grid, so they need no Strava data or downloads. The [changelog](CHANGELOG.md) lists what's changed, and the
 [roadmap](docs/roadmap.md) lists what might come next.
 
 ## Ideas / contributing
@@ -244,6 +264,9 @@ including:
 
 - Map data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), available
   under the ODbL. Routes you generate are derived from OSM data.
+- Elevation from NASA's [SRTM](https://www.earthdata.nasa.gov/data/instruments/srtm), via the
+  [Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) open dataset on AWS. Aerial
+  imagery © Esri, Maxar, Earthstar Geographics and the GIS User Community.
 - Built on [OSMnx](https://github.com/gboeing/osmnx), [SciPy](https://scipy.org),
   [fitparse](https://github.com/dtcooper/python-fitparse), [gpxpy](https://github.com/tkrajina/gpxpy),
   [Folium](https://python-visualization.github.io/folium/) and [Leaflet](https://leafletjs.com).
