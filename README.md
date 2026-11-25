@@ -214,10 +214,9 @@ parsed.
   Pythons, so make sure `curl` is on your PATH.
 - **"Couldn't listen on 127.0.0.1:8765"**: the web app is probably already running in another
   terminal. Use that one, or start another with `--port 8766`.
-- **Don't download the same new area from both tools at once.** For example, don't run a
-  command-line route and a web app route for the same new area at the same time: both would
-  write the same download files. Once an area is downloaded, using both is fine. A proper fix
-  is tracked in [#8](https://github.com/jmogil/new-roads-planner/issues/8).
+- **"Another process is already downloading … waiting for it to finish"**: the command line
+  and the web app share their caches, and only one of them downloads a new area at a time. The
+  second one waits, then reuses the download.
 - **To force a rebuild**: delete `cache/graph_*.pkl` to rebuild graphs from the saved `.osm`
   files, or delete the whole `cache/` folder to start from scratch.
 

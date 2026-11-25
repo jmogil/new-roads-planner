@@ -22,13 +22,6 @@ there. The issues are labelled by area:
   and download GPX. Also: a shared pipeline for both front ends, the export path remembered,
   a fix for one-way routes overshooting the distance, and the first automated tests.
 
-## Known problems
-
-- **Two processes downloading the same new area at once can corrupt it**
-  ([#8](https://github.com/jmogil/new-roads-planner/issues/8)), for example the command line
-  and the web app starting the same new area together. A lock per area would fix it. Until
-  then, let one finish first.
-
 ## Next: web app
 
 - **Cancel a running search** ([#1](https://github.com/jmogil/new-roads-planner/issues/1)).

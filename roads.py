@@ -9,13 +9,19 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import json
 import math
 import os
 import pickle
+import subprocess
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
 from scipy.spatial import cKDTree
+
+import progress
 
 # --- network definitions -------------------------------------------------------
 
@@ -136,22 +142,37 @@ def find_cached_graph(cache_dir, mode, lat, lon, radius_m) -> str | None:
     return min(fits, key=lambda a: a["radius_m"])["path"] if fits else None
 
 
+def _read_graph(path: str) -> RoadGraph:
+    with open(path, "rb") as fh:
+        return pickle.load(fh)
+
+
 def load_graph(cache_dir: str, mode: str, lat: float, lon: float, radius_m: float) -> RoadGraph:
     os.makedirs(cache_dir, exist_ok=True)
     hit = find_cached_graph(cache_dir, mode, lat, lon, radius_m)
     if hit:
-        with open(hit, "rb") as fh:
-            return pickle.load(fh)
+        return _read_graph(hit)
+    # One process at a time per area: the command line and the web app share cache/, and
+    # two downloads of the same area would write the same files.
+    lock = os.path.join(cache_dir, "locks", f"{mode}_{lat:.4f}_{lon:.4f}_{int(radius_m)}.lock")
+    with area_lock(lock, f"the {mode} road data for this area"):
+        hit = find_cached_graph(cache_dir, mode, lat, lon, radius_m)  # finished while we waited?
+        if hit:
+            return _read_graph(hit)
+        return _build_graph(cache_dir, mode, lat, lon, radius_m)
 
+
+def _build_graph(cache_dir: str, mode: str, lat: float, lon: float, radius_m: float) -> RoadGraph:
     import osmnx as ox
 
     net = NETWORKS[mode]
-    print(f"Downloading OpenStreetMap {mode} network, radius {radius_m/1000:.1f} km "
-          "(one-off; cached afterwards)...")
     osm_path = os.path.join(cache_dir, f"osm_{mode}_{lat:.4f}_{lon:.4f}_{int(radius_m)}.osm")
     if not os.path.exists(osm_path):
+        print(f"Downloading OpenStreetMap {mode} network, radius {radius_m/1000:.1f} km "
+              "(one-off; cached afterwards)...")
         _download_osm(osm_path, net["custom_filter"], lat, lon, radius_m)
     print("Building road graph...")
+    progress.report("build")
     if "footway" not in ox.settings.useful_tags_way:
         ox.settings.useful_tags_way = list(ox.settings.useful_tags_way) + ["footway"]
     G = ox.graph_from_xml(osm_path, bidirectional=net["network_type"] in ox.settings.bidirectional_network_types,
@@ -163,7 +184,53 @@ def load_graph(cache_dir: str, mode: str, lat: float, lon: float, radius_m: floa
     with open(path + ".part", "wb") as fh:  # write-then-rename, so an interrupted save can't leave a broken cache
         pickle.dump(rg, fh, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(path + ".part", path)
+    progress.check()
     return rg
+
+
+LOCK_POLL_S = 2.0
+
+
+@contextmanager
+def area_lock(lock_path: str, what: str):
+    """Hold an exclusive lock while downloading and building one area.
+
+    A second process wanting the same area waits here instead of writing the same
+    files. It's an operating-system lock, so it's released even if its holder crashes.
+    The lock file itself is left in place: deleting it could let two processes lock
+    different files of the same name.
+    """
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fh = open(lock_path, "a+")
+    try:
+        told = False
+        while not _try_lock(fh):
+            if not told:
+                print(f"Another process is already downloading {what}; waiting for it to finish...", flush=True)
+                progress.report("waiting")
+                told = True
+            progress.sleep(LOCK_POLL_S)
+        yield
+    finally:
+        fh.close()  # releases the lock
+
+
+def _try_lock(fh) -> bool:
+    try:
+        import fcntl
+    except ImportError:  # Windows
+        import msvcrt
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:  # held by another process (or another open file in this one)
+        return False
 
 
 # main public Overpass server first, then community mirrors (listed on the OSM wiki)
@@ -185,28 +252,60 @@ def _download_osm(out_path, filters, lat, lon, radius_m):
     dlon = radius_m / (111_320.0 * math.cos(math.radians(lat)))
     s, w, n, e = lat - dlat, lon - dlon, lat + dlat, lon + dlon
     # modest tiles: Overpass schedules small requests far more readily than big ones
-    k = max(1, math.ceil(2 * radius_m / TILE_M))
+    k = tiles_per_side(radius_m)
     tiles = []
     for i in range(k):
         for j in range(k):
             tiles.append((s + (n - s) * i / k, w + (e - w) * j / k,
                           s + (n - s) * (i + 1) / k, w + (e - w) * (j + 1) / k))
-    tile_paths = []
-    for t_i, (ts, tw, tn, te) in enumerate(tiles, 1):
-        tp = f"{out_path}.tile{t_i}"
-        tile_paths.append(tp)
-        if os.path.exists(tp):
+    tile_paths = [f"{out_path}.tile{t_i}" for t_i in range(1, len(tiles) + 1)]
+    for t_i, ((ts, tw, tn, te), tp) in enumerate(zip(tiles, tile_paths), 1):
+        if os.path.exists(tp):  # finished by an earlier, interrupted download
             continue
+        progress.report("download", t_i - 1, len(tiles))
         print(f"  tile {t_i}/{len(tiles)}")
         bbox = f"{ts:.6f},{tw:.6f},{tn:.6f},{te:.6f}"
         body = "".join(f"way{f}({bbox});" for f in filters)
+        started = time.time()
         _overpass_fetch(f"[out:xml][timeout:300];({body});(._;>;);out body qt;", tp)
+        _record_tile_seconds(os.path.dirname(out_path), time.time() - started)
+    progress.report("download", len(tiles), len(tiles))
     _merge_osm_xml(tile_paths, out_path)
     for tp in tile_paths:
         os.remove(tp)
 
 
 TILE_M = 12_000
+DEFAULT_TILE_SECONDS = 60.0  # until this computer has timed a few downloads itself
+STATS_FILE = "download_stats.json"
+
+
+def tiles_per_side(radius_m: float) -> int:
+    return max(1, math.ceil(2 * radius_m / TILE_M))
+
+
+def _record_tile_seconds(cache_dir: str, seconds: float) -> None:
+    """Remember how long tiles take here (the latest 50), for download estimates."""
+    path = os.path.join(cache_dir, STATS_FILE)
+    try:
+        with open(path) as fh:
+            stats = json.load(fh)
+    except (OSError, ValueError):
+        stats = {}
+    stats["tile_seconds"] = (list(stats.get("tile_seconds") or []) + [round(seconds, 1)])[-50:]
+    with open(path + ".part", "w") as fh:
+        json.dump(stats, fh)
+    os.replace(path + ".part", path)
+
+
+def typical_tile_seconds(cache_dir: str) -> float:
+    """Median download time per tile on this computer, or a default before there's history."""
+    try:
+        with open(os.path.join(cache_dir, STATS_FILE)) as fh:
+            times = [float(t) for t in json.load(fh).get("tile_seconds") or []]
+    except (OSError, ValueError, TypeError, AttributeError):
+        times = []
+    return float(np.median(times)) if len(times) >= 3 else DEFAULT_TILE_SECONDS
 
 
 def _merge_osm_xml(paths, out_path):
@@ -233,37 +332,52 @@ def _merge_osm_xml(paths, out_path):
     os.replace(tmp, out_path)
 
 
-def _overpass_fetch(query: str, out_path: str):
-    import subprocess
-    import time as _time
+def _run_cancellable(cmd: list[str]) -> tuple[int, str, str]:
+    """subprocess.run(), except that cancelling the search stops the command and raises Cancelled."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    while True:
+        try:
+            out, err = proc.communicate(timeout=0.5)
+            return proc.returncode, out, err
+        except subprocess.TimeoutExpired:
+            if progress.cancelled():
+                proc.kill()
+                proc.communicate()
+                raise progress.Cancelled()
 
+
+def _overpass_fetch(query: str, out_path: str):
     q_path = out_path + ".query"
     with open(q_path, "w") as fh:
         fh.write(query)
     tmp = out_path + ".part"
-    for attempt in range(9):
-        url = OVERPASS_URLS[attempt % len(OVERPASS_URLS)]
-        host = url.split("/")[2]
-        res = subprocess.run(
-            ["curl", "-sS", "--fail-with-body", "-A", USER_AGENT, "--max-time", "420", "--connect-timeout", "30",
-             "--data-urlencode", f"data@{q_path}", url, "-o", tmp, "-w", "%{http_code}"],
-            capture_output=True, text=True)
-        code = res.stdout.strip()
-        if res.returncode == 0 and code == "200":
-            # Overpass can answer 200 with a truncated result + <remark> on timeouts
-            with open(tmp, "rb") as fh:
-                fh.seek(max(0, os.path.getsize(tmp) - 4096))
-                tail = fh.read()
-            if b"<remark>" in tail or b"</osm>" not in tail:
-                code = "200 with incomplete data"
-                res = None
-        if res is not None and res.returncode == 0 and code == "200":
-            os.replace(tmp, out_path)
-            os.remove(q_path)
-            return
-        wait = 20 * (attempt // len(OVERPASS_URLS) + 1)
-        print(f"  {host} returned {code or res.stderr.strip()}; trying again in {wait}s...", flush=True)
-        _time.sleep(wait)
+    try:
+        for attempt in range(9):
+            url = OVERPASS_URLS[attempt % len(OVERPASS_URLS)]
+            host = url.split("/")[2]
+            returncode, out, err = _run_cancellable(
+                ["curl", "-sS", "--fail-with-body", "-A", USER_AGENT, "--max-time", "420", "--connect-timeout", "30",
+                 "--data-urlencode", f"data@{q_path}", url, "-o", tmp, "-w", "%{http_code}"])
+            code = out.strip()
+            ok = returncode == 0 and code == "200"
+            if ok:
+                # Overpass can answer 200 with a truncated result + <remark> on timeouts
+                with open(tmp, "rb") as fh:
+                    fh.seek(max(0, os.path.getsize(tmp) - 4096))
+                    tail = fh.read()
+                if b"<remark>" in tail or b"</osm>" not in tail:
+                    code, ok = "200 with incomplete data", False
+            if ok:
+                os.replace(tmp, out_path)
+                os.remove(q_path)
+                return
+            wait = 20 * (attempt // len(OVERPASS_URLS) + 1)
+            print(f"  {host} returned {code or err.strip()}; trying again in {wait}s...", flush=True)
+            progress.sleep(wait)
+    except progress.Cancelled:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
     raise RuntimeError("Could not download OpenStreetMap data from Overpass (try again later).")
 
 
@@ -273,10 +387,7 @@ def search_places(query: str, limit: int = 5, viewbox=None) -> list[dict]:
     viewbox = (west, north, east, south) prefers results in that area without
     excluding others. Returns [{"name", "lat", "lon"}], best match first.
     """
-    import json
-    import subprocess
-
-    cmd = ["curl", "-sS", "-G", "--fail", "--max-time", "20", "-A", USER_AGENT,
+    cmd =["curl", "-sS", "-G", "--fail", "--max-time", "20", "-A", USER_AGENT,
            "https://nominatim.openstreetmap.org/search",
            "--data-urlencode", f"q={query}", "--data-urlencode", "format=json",
            "--data-urlencode", f"limit={int(limit)}"]
@@ -435,6 +546,7 @@ def compute_coverage(rg: RoadGraph, tracks, cache_dir: str) -> np.ndarray:
     pad = 500
     bbox = ((nxy[:, 0].min() - pad, nxy[:, 1].min() - pad), (nxy[:, 0].max() + pad, nxy[:, 1].max() + pad))
     print("Matching your GPS history to the road network...")
+    progress.report("coverage")
     gps = gps_points_xy(tracks, proj, bbox)
     samples, owner = road_samples(rg, proj)
     if len(gps):
