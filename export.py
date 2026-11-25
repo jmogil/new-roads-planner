@@ -60,16 +60,22 @@ def nearby_roads(rg: RoadGraph, new_len: np.ndarray, bounds, decimals: int = 5) 
     return {"untraveled": lines(np.where(near & new)[0]), "traveled": lines(np.where(near & ~new)[0])}
 
 
-def gpx_xml(rg: RoadGraph, plan: Plan, name: str) -> str:
+def gpx_xml(rg: RoadGraph, plan: Plan, name: str, heights=None) -> str:
+    """The route as GPX 1.1. heights, if given, is a function (lats, lons) -> metres (NaN where
+    unknown) used to add <ele> to each point."""
     import gpxpy.gpx
 
     gpx = gpxpy.gpx.GPX()
     gpx.creator = "new-roads-planner"
     trk = gpxpy.gpx.GPXTrack(name=name)
     seg = gpxpy.gpx.GPXTrackSegment()
-    for lon, lat in route_coords(rg, plan):
-        seg.points.append(gpxpy.gpx.GPXTrackPoint(latitude=round(float(lat), 6),
-                                                  longitude=round(float(lon), 6)))
+    coords = route_coords(rg, plan)
+    ele = heights(coords[:, 1], coords[:, 0]) if heights is not None and len(coords) else None
+    for k, (lon, lat) in enumerate(coords):
+        point = gpxpy.gpx.GPXTrackPoint(latitude=round(float(lat), 6), longitude=round(float(lon), 6))
+        if ele is not None and np.isfinite(ele[k]):
+            point.elevation = round(float(ele[k]), 1)
+        seg.points.append(point)
     trk.segments.append(seg)
     gpx.tracks.append(trk)
     return gpx.to_xml()

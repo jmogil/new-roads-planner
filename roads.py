@@ -162,11 +162,16 @@ def load_graph(cache_dir: str, mode: str, lat: float, lon: float, radius_m: floa
         return _build_graph(cache_dir, mode, lat, lon, radius_m)
 
 
+def osm_file(cache_dir: str, mode: str, lat: float, lon: float, radius_m: float) -> str:
+    """Where an area's raw OpenStreetMap download goes (its tiles are this + .tileN while downloading)."""
+    return os.path.join(cache_dir, f"osm_{mode}_{lat:.4f}_{lon:.4f}_{int(radius_m)}.osm")
+
+
 def _build_graph(cache_dir: str, mode: str, lat: float, lon: float, radius_m: float) -> RoadGraph:
     import osmnx as ox
 
     net = NETWORKS[mode]
-    osm_path = os.path.join(cache_dir, f"osm_{mode}_{lat:.4f}_{lon:.4f}_{int(radius_m)}.osm")
+    osm_path = osm_file(cache_dir, mode, lat, lon, radius_m)
     if not os.path.exists(osm_path):
         print(f"Downloading OpenStreetMap {mode} network, radius {radius_m/1000:.1f} km "
               "(one-off; cached afterwards)...")
