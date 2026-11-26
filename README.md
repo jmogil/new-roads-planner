@@ -83,6 +83,16 @@ You also get:
 - **Clear**, to start over.
 - A **Map / Aerial** switch for aerial photos.
 
+**In Brisbane**, rides can favour the council's bike network (City Plan 2014's primary, secondary
+and local cycle routes and the RiverWalk):
+
+- A switch and a strength dial under **Bike network** make routes keep to those routes where they
+  can, and count new road on them for more.
+- The **Bike network** button on the map shows the network.
+- Each suggestion says how much of it is on the network.
+
+Elsewhere, the planner works as before.
+
 The export path is remembered, so from then on this is enough:
 
 ```bash
@@ -152,6 +162,7 @@ Route: 31.2 km, of which 19.4 km (62%) is new to you.
 | `--eagerness 0..0.95` | How much the connecting legs chase new roads. Higher = more new km but more zig-zag. Default 0.6. |
 | `--avoid-main-roads X` | 0 ignores road type, 1 is the default, 2 avoids primary and trunk roads strongly. |
 | `--count-all-activities` | Count roads from any activity as traveled, e.g. a road you walked counts for rides too. |
+| `--bike-network 0..1` | Rides: favour the local bike network where one is known (so far Brisbane City Council's). 0 is off (the default), 0.5 is balanced and 1 is strong. The output says how much of the route is on the network. |
 | `--restarts N`, `--iterations N` | Search effort (defaults 8 and 40). |
 | `--seed N` | Makes the search reproducible. |
 | `--export PATH` | Your Strava export, as a folder or `.zip`. Remembered after first use; can also be set with `STRAVA_EXPORT`. |
@@ -191,6 +202,11 @@ parsed.
    (`newroutes.py`). The web app (`webapp.py` plus the page in `web/`) draws routes on a
    [Leaflet](https://leafletjs.com) map and serves GPX downloads. It also adds elevation
    profiles (`elevation.py`, from SRTM data) and keeps saved routes (`saved.py`).
+6. **Local bike networks** (`bikenet.py`): downloads a council's published cycle network, so far
+   Brisbane's, and matches it onto the road graph. A road counts as on a route when the route runs
+   within 15 m of it in the same direction along at least half its length, so crossing streets
+   don't count. Favouring the network makes those roads cheaper to route along and their new road
+   worth more.
 
 [docs/architecture.md](docs/architecture.md) goes into more detail, including the web app's API.
 
@@ -209,6 +225,10 @@ parsed.
 - **An A → B route needs room for detours.** The finish has to be well within the distance
   (as a rule of thumb, the distance should be at least 1.5 times the straight line between start
   and finish) for the route to collect much new road.
+- **Brisbane's bike network is a planning map.** City Plan 2014's bicycle network overlay shows
+  the council's designated cycle routes. Most are on the ground, but some may be planned rather
+  than built, and a few RiverWalk sections aren't rideable on the bike network. The overlay covers
+  Brisbane City only, not neighbouring councils.
 - **Elevation is approximate.** It comes from the SRTM survey, about a 30 m grid that includes
   trees and buildings. It's good for a profile and a climbing estimate, not exact heights.
 - **Privacy:** your activity files stay on your computer, and `cache/` and `output/` are
@@ -218,6 +238,9 @@ parsed.
     using a bounding box around your start point.
   - Place searches (`--start-address`, or the web app's search boxes) go to OSM Nominatim. The
     web app also sends the area the map is showing, so nearby matches come first.
+  - Brisbane's bike network is downloaded from Brisbane City Council's open data portal: the
+    whole network at once, about 4 MB, refreshed every 90 days. Nothing about you or your routes is
+    sent.
   - Elevation data comes from the AWS Terrain Tiles open dataset, one 1° × 1° square (about
     110 km across) at a time. Only the square's name is sent, never a route.
   - The web app's map tiles come from OpenStreetMap's tile servers, and its aerial photos from
@@ -264,6 +287,9 @@ including:
 
 - Map data © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright), available
   under the ODbL. Routes you generate are derived from OSM data.
+- Bicycle network: [City Plan 2014 bicycle network overlay](https://data.brisbane.qld.gov.au/explore/dataset/cp14-bicycle-network-overlay/)
+  © Brisbane City Council, licensed under
+  [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 - Elevation from NASA's [SRTM](https://www.earthdata.nasa.gov/data/instruments/srtm), via the
   [Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) open dataset on AWS. Aerial
   imagery © Esri, Maxar, Earthstar Geographics and the GIS User Community.

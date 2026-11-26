@@ -15,7 +15,7 @@ import uuid
 
 ID = re.compile(r"[0-9a-f]{12}")
 SUMMARY = ("id", "name", "saved_at", "mode", "route_type", "distance_km", "new_km", "new_pct",
-           "ascent_m", "done", "bounds", "job", "index")  # job/index: which suggestion it was saved from
+           "ascent_m", "bike_km", "bike_pct", "done", "bounds", "job", "index")  # job/index: which suggestion it was saved from
 MAX_NAME = 80
 
 

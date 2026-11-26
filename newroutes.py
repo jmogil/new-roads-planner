@@ -49,6 +49,9 @@ def main(argv=None):
     ap.add_argument("--alternatives", type=int, default=1,
                     help="also output up to N-1 distinct alternative routes (default 1 = best only)")
     ap.add_argument("--seed", type=int, help="random seed for the search (for reproducible results)")
+    ap.add_argument("--bike-network", type=float, default=0.0, metavar="0..1",
+                    help="rides: favour the local cycle network where one is known (so far Brisbane City "
+                         "Council's): 0 = off (default), 0.5 = balanced, 1 = strongly")
     ap.add_argument("--count-all-activities", action="store_true",
                     help="treat roads from ANY activity type as traveled (default: same mode only)")
     ap.add_argument("--export", "--export-dir", dest="export",
@@ -70,7 +73,7 @@ def main(argv=None):
             mode=args.mode, distance_km=args.distance, start=start, end=args.end,
             alternatives=max(1, args.alternatives), tolerance=args.tolerance, eagerness=args.eagerness,
             avoid_main_roads=args.avoid_main_roads, restarts=args.restarts, iterations=args.iterations,
-            seed=args.seed, count_all_activities=args.count_all_activities))
+            seed=args.seed, count_all_activities=args.count_all_activities, bike_network=args.bike_network))
     except pipeline.PlannerError as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -91,10 +94,14 @@ def main(argv=None):
             "mode": args.mode, "target_km": args.distance, "route_km": round(km, 2),
             "new_km": round(new_km, 2), "new_pct": round(100 * new_km / km, 1),
             "start": list(result.start), "end": list(result.end) if result.end else None,
+            "bike_network_km": None if result.bike_m(plan) is None else round(result.bike_m(plan) / 1000, 2),
             "options": vars(result.options),
         })
         label = "Route" if i == 0 else f"Alternative {i}"
         print(f"\n{label}: {km:.1f} km, of which {new_km:.1f} km ({100*new_km/km:.0f}%) is new to you.")
+        if result.bike_m(plan) is not None:
+            bike_km = result.bike_m(plan) / 1000
+            print(f"  {bike_km:.1f} km ({100*bike_km/km:.0f}%) is on the {result.bike_source.name}.")
         print(f"  GPX: {base}.gpx\n  Map: {base}.html")
     print(f"\nDone in {time.time()-t0:.0f}s")
     return 0

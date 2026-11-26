@@ -31,6 +31,8 @@ there. The issues are labelled by area:
   - A lock so the command line and the web app can't corrupt a shared download
     ([#8](https://github.com/jmogil/new-roads-planner/issues/8)).
   - Also: a Clear button, an aerial view, a clearer colour for roads you've done, and a new icon.
+- **v0.4, Brisbane's bike network.** Rides can favour Brisbane City Council's cycle routes with a
+  strength dial, the network can be shown on the map, and routes report how much of them is on it.
 
 ## Next: web app
 
@@ -39,6 +41,14 @@ there. The issues are labelled by area:
   recent suggestions, so "generate again" explores further.
 - **Via points and areas to avoid** ([#6](https://github.com/jmogil/new-roads-planner/issues/6)).
   Click to add a "go through here" point, or draw an area to keep out of.
+
+## Next: bike networks
+
+- **More councils' networks.** Moreton Bay, Logan, Ipswich and other cities could each be added as
+  an entry in `bikenet.SOURCES` where they publish their cycle networks as open data.
+- **Cycle infrastructure anywhere, from OpenStreetMap.** OSM tags cycleways, bike lanes and
+  signed bike routes worldwide. Reading those tags when building the graph would let rides favour
+  cycle infrastructure everywhere, with council data adding detail where it exists.
 
 ## Next: planner
 

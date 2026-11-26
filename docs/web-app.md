@@ -8,6 +8,7 @@ time. If both need the same new area, the second waits for the first's download.
 
 - [Starting and stopping it](#starting-and-stopping-it)
 - [Planning a route](#planning-a-route)
+- [Brisbane's bike network](#brisbanes-bike-network)
 - [More options](#more-options)
 - [While it searches](#while-it-searches)
 - [Reading the results](#reading-the-results)
@@ -94,12 +95,74 @@ can run up to 5% over the distance. The hints under the slider tell you:
   computer has timed a few downloads it assumes a minute a part. After that it uses the
   typical time it has actually seen. Downloaded areas appear on the map as dashed circles.
 
+### Bike network (Brisbane)
+
+When the start (or an A → B finish) is in Brisbane City and you're planning a ride, a **Bike
+network** section appears. See [Brisbane's bike network](#brisbanes-bike-network).
+
 ### Generate and Clear
 
 **Generate routes** starts a search. **Clear** removes the routes and the finish and puts the
 start back at your usual start. Your activity, route type, distance and options stay as they
 are. **Reset these options**, at the bottom of More options, puts the options back to their
 defaults.
+
+## Brisbane's bike network
+
+Brisbane City Council publishes its bicycle network as open data. It's the City Plan 2014
+*bicycle network overlay*, with four kinds of route:
+
+| Route | What it is |
+|---|---|
+| **Primary cycle route** | The main commuter and recreational routes: bikeways, the riverside paths and major on-road routes |
+| **Secondary cycle route** | Routes linking suburbs to the primary network |
+| **Local cycle route** | Quieter neighbourhood connections |
+| **RiverWalk** | The riverside walkways, treated like primary routes |
+
+### Favouring it
+
+For rides in Brisbane, **Prefer Brisbane's bike network** is on by default. **How strongly**
+sets the balance:
+
+- Routes keep to council cycle routes where they can, because roads on the network count as
+  shorter when getting between areas of new road.
+- New road on the network counts for more than new road elsewhere, so routes also explore new
+  stretches of the network.
+
+How much this changes a route depends on the area. On a 30 km loop from one start, about 40% of
+the route was on the network with the switch off, about two thirds at *balanced* (0.5, the
+default), and over 80% at full strength. New road dropped only slightly. With the switch off,
+routes chase new road wherever it is, as in earlier versions.
+
+Each suggestion shows how much of it is on the network ("25 km on the bike network (79%)"). When
+the network is favoured, the top suggestion is labelled **best fit** rather than **most new
+road**, since it's no longer ranked on new road alone.
+
+The first ride in an area downloads the network (about 4 MB, refreshed every 90 days) and matches
+it onto that area's roads. That's a one-off that takes a few seconds.
+
+### Seeing it on the map
+
+The **Bike network** button at the top left of the map shows the whole network:
+
+- thick bright green for primary routes
+- deeper green for secondary routes
+- thin dashed green for local routes
+- dashed for the RiverWalk
+
+The Map key explains the colours while it's on. It works on both the map and the aerial view, and
+stays on next time until you switch it off.
+
+### Things to know
+
+- **It's a planning map.** The overlay shows the council's designated routes. Most exist on the
+  ground, but some may be planned rather than built. Check the route before you go.
+- A road counts as on a route when the route runs within 15 m of it, in the same direction, for
+  at least half its length. Roads running right alongside a route, such as the two carriageways
+  of a divided road next to a bikeway, can count too. The main-roads setting still steers routes
+  off busy roads.
+- It covers Brisbane City Council's area only, not neighbouring councils such as Moreton Bay,
+  Logan or Ipswich. Elsewhere the section doesn't appear, and planning works as before.
 
 ## More options
 
@@ -191,6 +254,7 @@ of `cache/`, they're git-ignored, since they show where you go.
 | Dashed orange | Other untraveled roads around the routes |
 | Teal | Roads you've done. This layer is off by default. |
 | Dashed circles | Areas whose road data is downloaded |
+| Greens (with **Bike network** on) | Brisbane City Council's cycle routes: thick for primary, deeper green for secondary, thin dashed for local, dashed for the RiverWalk |
 
 The **Map key** in the corner switches the background layers on and off, and folds away.
 
@@ -230,4 +294,6 @@ in mind:
 | The download is slow, or keeps retrying | The public OpenStreetMap servers are busy. Leave it running, or cancel it and try later; finished parts are kept. |
 | "Elevation isn't available for this route" | The elevation data couldn't be downloaded, for example with no internet connection. The routes are fine; generate again later to get the profile. |
 | "This loop can't be ridden the other way" | A one-way road on it has no short legal way round. Generate again for a different loop. |
+| No **Bike network** section | It only appears for rides whose start (or A → B finish) is in Brisbane City. |
+| "The Brisbane City Council bicycle network isn't available" | The council's open data portal couldn't be reached, and it hasn't been downloaded before. Routes are planned without it; try again later. |
 | A route uses a road you'd rather avoid | Set **Main roads** to *Avoid strongly*, generate again, or pick another suggestion. Always check a route before you go. |
