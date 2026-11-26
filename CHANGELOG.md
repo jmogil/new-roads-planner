@@ -2,6 +2,50 @@
 
 All notable changes to this project.
 
+## 0.3.0, 2026-11-25
+
+### Added (web app)
+
+- **Cancel a running search** ([#1](https://github.com/jmogil/new-roads-planner/issues/1)).
+  It stops within a second or so, and a cancelled download keeps its finished parts, so the
+  next search there picks up where it stopped.
+- **Progress and estimates** ([#3](https://github.com/jmogil/new-roads-planner/issues/3)):
+  - Before you start, the hint says whether an area's road data still needs downloading, how
+    many parts that is, and roughly how long it will take. The estimate learns from this
+    computer's own download times.
+  - While it works, a progress bar shows downloads part by part and search progress, with the
+    time left.
+- **Direction and distance markers** ([#2](https://github.com/jmogil/new-roads-planner/issues/2)):
+  arrows along the chosen route, and km markers every 5 km for rides and 1 km for runs, spaced
+  for the zoom level. **Reverse** turns a loop around. On the bike network, one-way stretches
+  get the shortest legal way round, and the page says how much those detours add.
+- **Elevation profile** ([#7](https://github.com/jmogil/new-roads-planner/issues/7)) for the
+  chosen route:
+  - The profile is coloured by new and done road, and pointing at it marks the spot on the map.
+  - Each suggestion shows its total climb, and GPX downloads now include elevations.
+  - The data is SRTM, from the AWS Terrain Tiles open dataset, downloaded a 1° square at a time
+    and cached.
+- **Saved routes** ([#4](https://github.com/jmogil/new-roads-planner/issues/4)): save a
+  suggestion, then show it again, download its GPX, rename it, mark it done or delete it. Saved
+  routes are kept in `cache/saved_routes/`.
+- **Clear** button, to remove the routes and finish and go back to your usual start. **Reset
+  these options** under More options puts the options back to their defaults.
+- **Map / Aerial** switch for Esri aerial photos with place names. Routes and roads are drawn
+  brighter on the photos.
+- A new app icon: a road across a map. It also comes as a home-screen icon for phones.
+
+### Changed
+
+- "Roads you've done" is now drawn in a saturated teal, so it stands out from the grey map,
+  with brighter versions for dark mode and the aerial photos.
+
+### Fixed
+
+- **Two processes downloading the same new area at once could corrupt it**
+  ([#8](https://github.com/jmogil/new-roads-planner/issues/8)). That could happen with the
+  command line and the web app, which share `cache/`. Downloads are now locked per area: the
+  second process waits, then reuses the download. `tracks.pkl` is also written safely now.
+
 ## 0.2.0, 2026-11-24
 
 ### Added

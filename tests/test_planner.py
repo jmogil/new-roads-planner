@@ -6,7 +6,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from planner import PlanOptions, Planner  # noqa: E402
+import numpy as np  # noqa: E402
+
+from planner import OneWay, Plan, PlanOptions, Planner, reverse_loop  # noqa: E402
 from synthetic import grid_graph, node, random_traveled  # noqa: E402
 
 N = 25  # 25 x 25 grid, 200 m blocks = 4.8 km across
@@ -65,6 +67,41 @@ class PlannerTests(unittest.TestCase):
                 ea, eb = set(plans[a].edges), set(plans[b].edges)
                 self.assertLess(len(ea & eb) / min(len(ea), len(eb)), 0.5)
 
+
+class ReverseLoopTests(unittest.TestCase):
+    def test_two_way_loop_simply_reverses(self):
+        rg = grid_graph(N)
+        plan = Planner(rg, random_traveled(rg), PlanOptions(distance_m=5000, seed=3, restarts=2, iterations=5)).plan(
+            node(N, 12, 12))[0]
+        rev, extra = reverse_loop(rg, plan, np.zeros(len(rg.edge_len)))
+        self.assertEqual(rev.nodes, plan.nodes[::-1])
+        self.assertEqual(extra, 0.0)
+
+    def test_detours_round_a_one_way_street_or_refuses(self):
+        # nodes 0-1-2 joined by two-way roads, "One Way Street" running only 2 -> 0, and a two-way
+        # back way 0-3-2 that's 200 m longer
+        rg = grid_graph(2)  # borrow a tiny 4-junction graph and replace its roads
+        rg.edge_u, rg.edge_v = np.array([0, 1, 2, 0, 3], np.int32), np.array([1, 2, 0, 3, 2], np.int32)
+        rg.edge_len = np.array([1000.0, 1000.0, 1000.0, 600.0, 600.0])
+        rg.edge_name = ["", "", "One Way Street", "", ""]
+        arcs = [(0, 1, 0), (1, 0, 0), (1, 2, 1), (2, 1, 1), (2, 0, 2), (0, 3, 3), (3, 0, 3), (3, 2, 4), (2, 3, 4)]
+        rg.arc_from, rg.arc_to, rg.arc_edge = (np.array(c, np.int32) for c in zip(*arcs))
+        loop = Plan(nodes=[0, 1, 2, 0], edges=[0, 1, 2], length_m=3000.0, new_m=0.0)
+
+        rev, extra = reverse_loop(rg, loop, np.zeros(5), max_extra_m=500)
+        self.assertEqual(rev.nodes, [0, 3, 2, 1, 0])  # round the back way, then the two-way roads home
+        self.assertAlmostEqual(extra, 200.0)
+        with self.assertRaises(OneWay) as cm:  # not if the back way is too long a detour
+            reverse_loop(rg, loop, np.zeros(5), max_extra_m=100)
+        self.assertEqual(str(cm.exception), "One Way Street")
+
+    def test_an_all_one_way_loop_cannot_reverse(self):
+        rg = grid_graph(2)
+        rg.edge_u, rg.edge_v = np.array([0, 1, 2], np.int32), np.array([1, 2, 0], np.int32)
+        rg.edge_len, rg.edge_name = np.full(3, 1000.0), ["Ring Road", "Ring Road", "Ring Road"]
+        rg.arc_from, rg.arc_to, rg.arc_edge = rg.edge_u.copy(), rg.edge_v.copy(), np.arange(3, dtype=np.int32)
+        with self.assertRaises(OneWay):
+            reverse_loop(rg, Plan(nodes=[0, 1, 2, 0], edges=[0, 1, 2], length_m=3000.0, new_m=0.0), np.zeros(3))
 
 if __name__ == "__main__":
     unittest.main()

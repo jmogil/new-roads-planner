@@ -21,34 +21,24 @@ there. The issues are labelled by area:
   the start and finish by search, map click or usual start, compare up to three suggestions,
   and download GPX. Also: a shared pipeline for both front ends, the export path remembered,
   a fix for one-way routes overshooting the distance, and the first automated tests.
-
-## Known problems
-
-- **Two processes downloading the same new area at once can corrupt it**
-  ([#8](https://github.com/jmogil/new-roads-planner/issues/8)), for example the command line
-  and the web app starting the same new area together. A lock per area would fix it. Until
-  then, let one finish first.
+- **v0.3, web app round two.** Covers:
+  - Cancelling a search ([#1](https://github.com/jmogil/new-roads-planner/issues/1)).
+  - Direction arrows, km markers and reversing loops
+    ([#2](https://github.com/jmogil/new-roads-planner/issues/2)).
+  - Download progress and estimates ([#3](https://github.com/jmogil/new-roads-planner/issues/3)).
+  - Saved routes ([#4](https://github.com/jmogil/new-roads-planner/issues/4)).
+  - Elevation profiles ([#7](https://github.com/jmogil/new-roads-planner/issues/7)).
+  - A lock so the command line and the web app can't corrupt a shared download
+    ([#8](https://github.com/jmogil/new-roads-planner/issues/8)).
+  - Also: a Clear button, an aerial view, a clearer colour for roads you've done, and a new icon.
 
 ## Next: web app
 
-- **Cancel a running search** ([#1](https://github.com/jmogil/new-roads-planner/issues/1)).
-  Downloads can take a while. A cancel button needs the download loop and the search to check
-  a stop flag between tiles or restarts.
-- **Direction and distance markers** on the route
-  ([#2](https://github.com/jmogil/new-roads-planner/issues/2)): arrows, and a marker every
-  5 km or 1 km. For loops, a reverse direction button (one-way streets permitting on rides).
-- **Download progress as a percentage**, and an estimate before starting ("about 25 parts")
-  ([#3](https://github.com/jmogil/new-roads-planner/issues/3)).
-- **Saved routes** ([#4](https://github.com/jmogil/new-roads-planner/issues/4)). Keep routes
-  you like with a name and date, and mark routes as done.
 - **Don't suggest the same thing twice**
   ([#5](https://github.com/jmogil/new-roads-planner/issues/5)). Steer away from roads in
   recent suggestions, so "generate again" explores further.
 - **Via points and areas to avoid** ([#6](https://github.com/jmogil/new-roads-planner/issues/6)).
   Click to add a "go through here" point, or draw an area to keep out of.
-- **Elevation profile** for the chosen route
-  ([#7](https://github.com/jmogil/new-roads-planner/issues/7)), once elevation data is in
-  (see #11 below).
 
 ## Next: planner
 
@@ -56,8 +46,9 @@ there. The issues are labelled by area:
   ([#9](https://github.com/jmogil/new-roads-planner/issues/9)).
 - **Directional mode,** so a road ridden in the other direction counts as new
   ([#10](https://github.com/jmogil/new-roads-planner/issues/10)).
-- **Elevation-aware routing:** avoid or seek climbs, and report total ascent
-  ([#11](https://github.com/jmogil/new-roads-planner/issues/11)).
+- **Elevation-aware routing:** avoid or seek climbs
+  ([#11](https://github.com/jmogil/new-roads-planner/issues/11)). The web app already has the
+  elevation data and reports each route's climbing, so this is about using it in the search.
 - **A better fallback when the finish is barely reachable**
   ([#12](https://github.com/jmogil/new-roads-planner/issues/12)). Today, if the
   cheapest-by-preference path to the finish is over budget, the planner gives up, even when

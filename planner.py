@@ -22,6 +22,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
+import progress
 from roads import Projector, RoadGraph
 
 
@@ -146,6 +147,8 @@ class Planner:
         found: list[Plan] = []
         n_restarts = o.restarts * (1 if alternatives == 1 else 2)
         for r in range(n_restarts):
+            progress.report("search", r, n_restarts)
+            progress.check()
             greedy = 0 if r == 0 else 3
             if alternatives > 1 and r >= n_restarts // 2:
                 # diversify: hide a random 40% of target areas
@@ -204,6 +207,7 @@ class Planner:
         cur, (cur_v, cur_l) = tour, self._tour_value(tour)
         best, best_v, best_l = cur, cur_v, cur_l
         for _ in range(iters):
+            progress.check()
             inner = cur[1:-1]
             if not inner:
                 break
@@ -319,3 +323,77 @@ class Planner:
             nodes.append(p.nodes[i + 1])
             edges.append(e)
         return Plan(nodes=nodes, edges=edges, length_m=length, new_m=new, waypoints=p.waypoints)
+
+
+# -- turning a loop around ------------------------------------------------------------
+
+
+class OneWay(Exception):
+    """A road on the route can't be travelled the other way, and there's no short way round it."""
+
+
+def _arc_map(rg: RoadGraph) -> dict:
+    """(from node, to node) -> the road used for that step, for every step allowed. Cached on the graph."""
+    arcs = getattr(rg, "_arc_map", None)
+    if arcs is None:
+        arcs = rg._arc_map = {(f, t): e for f, t, e in zip(rg.arc_from.tolist(), rg.arc_to.tolist(),
+                                                            rg.arc_edge.tolist())}
+    return arcs
+
+
+def _length_graph(rg: RoadGraph):
+    csr = getattr(rg, "_length_csr", None)
+    if csr is None:
+        csr = rg._length_csr = csr_matrix((rg.edge_len[rg.arc_edge], (rg.arc_from, rg.arc_to)),
+                                          shape=(rg.n_nodes, rg.n_nodes))
+    return csr
+
+
+def reverse_loop(rg: RoadGraph, plan: Plan, new_len: np.ndarray, max_extra_m: float = 1500.0) -> tuple[Plan, float]:
+    """The same loop the other way round.
+
+    Where a stretch of it is one-way (on the bike network, say a divided road whose carriageways
+    are mapped separately), take the shortest legal way round instead, as long as that adds no more
+    than max_extra_m. Returns (the reversed plan, metres the detours added). Raises OneWay, naming
+    the street, when a stretch has no such way round.
+    """
+    arcs = _arc_map(rg)
+    nodes, edges = plan.nodes[::-1], plan.edges[::-1]
+    out_nodes, out_edges = [nodes[0]], []
+    k = 0
+    while k < len(edges):
+        a, b, e = nodes[k], nodes[k + 1], edges[k]
+        if a == b:  # a cul-de-sac circuit: it comes back to where it started either way
+            out_nodes.append(b)
+            out_edges.append(e)
+            k += 1
+            continue
+        if (a, b) in arcs:
+            out_nodes.append(b)
+            out_edges.append(arcs[(a, b)])
+            k += 1
+            continue
+        m = k  # the one-way stretch: every step from k up to m can't be taken backwards
+        while m + 1 < len(edges) and nodes[m + 1] != nodes[m + 2] and (nodes[m + 1], nodes[m + 2]) not in arcs:
+            m += 1
+        target = nodes[m + 1]
+        if target == a:  # a one-way stretch that comes back to where it started (say, the whole loop)
+            raise OneWay(rg.edge_name[e] or "one of its roads")
+        skipped = float(rg.edge_len[edges[k:m + 1]].sum())
+        dist, pred = dijkstra(_length_graph(rg), directed=True, indices=a, return_predecessors=True,
+                              limit=skipped + max_extra_m)
+        if not np.isfinite(dist[target]):
+            raise OneWay(rg.edge_name[e] or "one of its roads")
+        path = [target]
+        while path[-1] != a:
+            path.append(int(pred[path[-1]]))
+        path.reverse()
+        for f, t in zip(path[:-1], path[1:]):
+            out_nodes.append(t)
+            out_edges.append(arcs[(f, t)])
+        k = m + 1
+    used = np.asarray(out_edges, dtype=np.int64)
+    length = float(rg.edge_len[used].sum())
+    reversed_plan = Plan(nodes=out_nodes, edges=[int(x) for x in out_edges], length_m=length,
+                         new_m=float(new_len[np.unique(used)].sum()), waypoints=plan.waypoints[::-1])
+    return reversed_plan, max(0.0, length - plan.length_m)

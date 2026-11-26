@@ -2,11 +2,20 @@
 "use strict";
 
 const MODES = {
-  ride: { distance: 40, min: 5, max: 200, step: 1, plural: "rides" },
-  run: { distance: 10, min: 2, max: 60, step: 0.5, plural: "runs" },
+  ride: { distance: 40, min: 5, max: 200, step: 1, plural: "rides", kmMarks: [5, 10, 20, 50, 100] },
+  run: { distance: 10, min: 2, max: 60, step: 0.5, plural: "runs", kmMarks: [1, 2, 5, 10, 20] },
 };
+const DEFAULT_OPTIONS = { alternatives: 3, avoidMain: 1, eagerness: 0.6, effort: "normal", countAll: false };
 const STORE_KEY = "new-roads-planner:v1";
 const POLL_MS = 1000;
+const STAGES = { // what the planner is doing, from its progress reports
+  network: "Loading the road network…",
+  waiting: "Waiting for another download of this area to finish…",
+  build: "Building the road network (a one-off for this area)…",
+  coverage: "Working out which roads you've done…",
+  search: "Searching for the route with the most new road…",
+  elevation: "Adding elevation (a one-off download for this area)…",
+};
 
 const $ = (sel) => document.querySelector(sel);
 const rootStyle = getComputedStyle(document.documentElement);
@@ -14,6 +23,8 @@ const color = (name) => rootStyle.getPropertyValue(name).trim();
 const nf0 = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
 const nf1 = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
 const km = (v) => nf1.format(v);
+const dateFormat = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", year: "numeric" });
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
 const state = {
   mode: "ride",
@@ -21,15 +32,58 @@ const state = {
   distance: { ride: MODES.ride.distance, run: MODES.run.distance },
   start: null,                  // { lat, lon, label, source: "usual" | "search" | "map" | "gps" }
   end: null,
-  options: { alternatives: 3, avoidMain: 1, eagerness: 0.6, effort: "normal", countAll: false },
-  show: { untraveled: true, traveled: false, areas: true, key: true },
+  options: { ...DEFAULT_OPTIONS },
+  show: { untraveled: true, traveled: false, areas: true, key: true, aerial: false },
   config: null,                 // from /api/config
   pick: null,                   // "start" | "end" while the next map click sets it
   job: null,                    // id of the search in progress
   lastJob: null,                // id of the latest search, to show its routes again after a reload
-  result: null,                 // the finished search
-  selected: 0,                  // which suggested route is highlighted
+  result: null,                 // the routes on show: a finished search, or a saved route
+  context: null,                // roads around the routes, for the background layers
+  selected: 0,                  // which route is highlighted
+  saved: [],                    // saved route summaries
+  renaming: null,               // id of the saved route whose name is being edited
 };
+
+// ---------- small helpers ----------
+
+function el(tag, props = {}) {
+  return Object.assign(document.createElement(tag), props);
+}
+
+function icon(name) {
+  return `<svg class="i" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+}
+
+function miniButton(text, iconName, onClick, title) {
+  const b = el("button", { type: "button", className: "mini" });
+  if (title) b.title = title;
+  b.innerHTML = icon(iconName);
+  b.append(document.createTextNode(text));
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+function gpxLink(href) {
+  const a = el("a", { className: "mini", href, title: "Download as GPX, for a bike computer, watch or route app" });
+  a.setAttribute("download", "");
+  a.innerHTML = `${icon("download")}GPX`;
+  return a;
+}
+
+function duration(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${Math.max(5, Math.round(s / 5) * 5)} seconds`;
+  const m = Math.round(s / 60);
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+}
+
+function distanceKm(a, b) {
+  const rad = Math.PI / 180;
+  const h = Math.sin((b.lat - a.lat) * rad / 2) ** 2 +
+    Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin((b.lon - a.lon) * rad / 2) ** 2;
+  return 12742 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
 
 // ---------- saving settings between visits (this browser only) ----------
 
@@ -85,25 +139,30 @@ async function api(path, { method = "GET", body } = {}) {
   return data;
 }
 
-function distanceKm(a, b) {
-  const rad = Math.PI / 180;
-  const h = Math.sin((b.lat - a.lat) * rad / 2) ** 2 +
-    Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin((b.lon - a.lon) * rad / 2) ** 2;
-  return 12742 * Math.asin(Math.min(1, Math.sqrt(h)));
-}
-
 // ---------- the map ----------
 
 const map = L.map("map", { zoomControl: false, worldCopyJump: true }).setView([20, 0], 2);
 L.control.zoom({ position: "topright" }).addTo(map);
 L.control.scale({ imperial: false, position: "bottomright" }).addTo(map);
-L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  maxZoom: 19,
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-}).addTo(map);
+const bases = {
+  map: L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19, className: "base-osm",
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  }),
+  aerial: L.layerGroup([
+    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+      maxZoom: 19, maxNativeZoom: 18,
+      attribution: "Imagery &copy; Esri, Maxar, Earthstar Geographics and the GIS User Community",
+    }),
+    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}", {
+      maxZoom: 19, maxNativeZoom: 18, opacity: 0.85,
+    }),
+  ]),
+};
 
-// draw order: downloaded areas < nearby roads < other suggestions < chosen route < markers
-for (const [pane, z] of [["areas", 350], ["context", 380], ["alts", 390]]) map.createPane(pane).style.zIndex = z;
+// draw order: downloaded areas < nearby roads < other suggestions < chosen route < arrows < pins
+for (const [pane, z] of [["areas", 350], ["context", 380], ["alts", 390], ["marks", 450]]) map.createPane(pane).style.zIndex = z;
+map.getPane("marks").style.pointerEvents = "none";
 const contextRenderer = L.canvas({ pane: "context", padding: 0.3 }); // thousands of lines: canvas is much faster
 const layers = {
   areas: L.layerGroup(),
@@ -111,9 +170,30 @@ const layers = {
   traveled: L.layerGroup(),
   alts: L.layerGroup().addTo(map),
   route: L.layerGroup().addTo(map),
+  marks: L.layerGroup().addTo(map),
   places: L.layerGroup().addTo(map),
+  hover: L.layerGroup().addTo(map),
 };
 const markers = {};
+
+function setBase(kind) {
+  state.show.aerial = kind === "aerial";
+  for (const [name, layer] of Object.entries(bases)) {
+    if (name === kind) layer.addTo(map); else layer.remove();
+  }
+  document.documentElement.classList.toggle("aerial", state.show.aerial);
+  document.querySelectorAll("[data-base]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.base === kind)));
+  restyle();
+  save();
+}
+
+// colours depend on the theme and the base map, so redraw everything that uses them
+function restyle() {
+  renderAreas();
+  drawRoutes();
+  drawContext();
+  renderProfile();
+}
 
 function applyLayerToggles() {
   for (const k of ["untraveled", "traveled", "areas"]) {
@@ -128,9 +208,15 @@ function renderAreas() {
     if (a.mode !== state.mode) continue;
     L.circle([a.lat, a.lon], {
       radius: a.radius_m, pane: "areas", interactive: false,
-      color: color("--area"), weight: 1.5, opacity: 0.55, dashArray: "6 8", fillOpacity: 0.025,
+      color: color("--area"), weight: 1.5, opacity: 0.6, dashArray: "6 8", fillOpacity: 0.025,
     }).addTo(layers.areas);
   }
+}
+
+function fitMap(bounds, maxZoom = 16) {
+  const key = $("#legend");
+  const roomy = $("#map").clientWidth > 640 && key.open && key.offsetParent !== null;
+  map.fitBounds(bounds, { paddingTopLeft: [roomy ? key.offsetWidth + 28 : 40, 56], paddingBottomRight: [40, 40], maxZoom });
 }
 
 map.on("click", (e) => {
@@ -142,12 +228,9 @@ map.on("click", (e) => {
     setPlace(which, place, { pan: false });
     return;
   }
-  const box = document.createElement("div");
-  box.className = "popup-actions";
+  const box = el("div", { className: "popup-actions" });
   const add = (text, which) => {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.textContent = text;
+    const b = el("button", { type: "button", textContent: text });
     b.addEventListener("click", () => { map.closePopup(); setPlace(which, place, { pan: false }); });
     box.append(b);
   };
@@ -155,6 +238,7 @@ map.on("click", (e) => {
   if (state.routeType === "oneway") add("Finish here", "end");
   L.popup({ closeButton: false, offset: [0, -2] }).setLatLng(e.latlng).setContent(box).openOn(map);
 });
+map.on("zoomend", () => drawMarks());
 
 // ---------- start and finish ----------
 
@@ -185,12 +269,10 @@ function renderPlaces() {
 }
 
 function placeLabel(which, emptyText) {
-  const el = $(`#${which}-label`);
+  const label = $(`#${which}-label`);
   const p = state[which];
-  if (!p) { el.textContent = emptyText; return; }
-  const name = document.createElement("strong");
-  name.textContent = p.label || "Dropped pin";
-  el.replaceChildren(name, ` · ${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`);
+  if (!p) { label.textContent = emptyText; return; }
+  label.replaceChildren(el("strong", { textContent: p.label || "Dropped pin" }), ` · ${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`);
 }
 
 function setPlace(which, place, { pan = true } = {}) {
@@ -278,11 +360,9 @@ function shortName(name) {
 
 function showList(list, items) {
   list.replaceChildren(...items.map((it) => {
-    const li = document.createElement("li");
+    const li = el("li");
     if (it.pick) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.textContent = it.text;
+      const b = el("button", { type: "button", textContent: it.text });
       b.addEventListener("click", it.pick);
       li.append(b);
     } else {
@@ -342,7 +422,7 @@ function setDistance(value) {
 function showDistance() {
   const m = MODES[state.mode];
   const d = state.distance[state.mode];
-  $("#distance-range").value = String(Math.min(m.max, Math.max(m.min, d)));
+  $("#distance-range").value = String(clamp(d, m.min, m.max));
   $("#distance").value = String(d);
 }
 
@@ -350,21 +430,6 @@ function showEagerness() {
   const v = state.options.eagerness;
   $("#eagerness").value = String(v);
   $("#eagerness-value").textContent = `${v < 0.3 ? "a little" : v < 0.75 ? "balanced" : "keenly"} · ${v.toFixed(2)}`;
-}
-
-function searchCenter() {
-  if (!state.start) return null;
-  if (state.routeType === "oneway" && state.end) {
-    return { lat: (state.start.lat + state.end.lat) / 2, lon: (state.start.lon + state.end.lon) / 2 };
-  }
-  return state.start;
-}
-
-// mirrors pipeline.Workspace.graph_for: is there a downloaded road graph big enough?
-function areaReady(mode, center, distance) {
-  const needKm = distance * 1.05 / 2 + 1.5;
-  return ((state.config && state.config.areas) || [])
-    .some((a) => a.mode === mode && distanceKm(center, a) + needKm <= a.radius_m / 1000);
 }
 
 function updateHints() {
@@ -387,20 +452,45 @@ function updateHints() {
   } else {
     hint.textContent = `About ${km(d)} km from start to finish.`;
   }
-
-  const area = $("#area-hint");
-  const c = searchCenter();
-  if (!c || !state.config) {
-    area.hidden = true;
-  } else {
-    const ready = areaReady(state.mode, c, d);
-    area.hidden = false;
-    area.className = `hint ${ready ? "ok" : "warn"}`;
-    area.textContent = ready
-      ? "✓ Road data for this area is downloaded, so this takes seconds."
-      : "The first route here downloads road data from OpenStreetMap. That's a one-off, but can take 2–30 minutes.";
-  }
+  scheduleEstimate();
   updateGenerate();
+}
+
+// does this area's road data need downloading first? (asked of webapp.py, which knows the cache)
+let estimateTimer = 0;
+let estimateKey = "";
+
+function scheduleEstimate() {
+  clearTimeout(estimateTimer);
+  estimateTimer = setTimeout(updateEstimate, 250);
+}
+
+async function updateEstimate() {
+  const area = $("#area-hint");
+  const oneway = state.routeType === "oneway";
+  if (!state.start || !state.config || (oneway && !state.end)) { area.hidden = true; estimateKey = ""; return; }
+  const params = new URLSearchParams({
+    mode: state.mode,
+    distance_km: String(state.distance[state.mode]),
+    start: `${state.start.lat.toFixed(6)},${state.start.lon.toFixed(6)}`,
+  });
+  if (oneway) params.set("end", `${state.end.lat.toFixed(6)},${state.end.lon.toFixed(6)}`);
+  const key = params.toString();
+  estimateKey = key;
+  let e;
+  try { e = await api(`/api/estimate?${params}`); } catch (_) { area.hidden = true; return; }
+  if (key !== estimateKey) return; // the settings have changed since
+  area.hidden = false;
+  if (e.ready) {
+    area.className = "hint ok";
+    area.textContent = "✓ Road data for this area is downloaded, so this takes seconds.";
+  } else {
+    const done = e.tiles - e.tiles_left;
+    area.className = "hint warn";
+    area.textContent = `The first route here downloads this area's road data from OpenStreetMap: ` +
+      `${e.tiles} part${e.tiles === 1 ? "" : "s"}${done ? ` (${done} already done)` : ""}, ` +
+      `taking about ${duration(e.minutes * 60)}. It's a one-off, and you can cancel it.`;
+  }
 }
 
 function updateGenerate() {
@@ -408,20 +498,29 @@ function updateGenerate() {
   const needEnd = state.routeType === "oneway" && !state.end;
   btn.disabled = Boolean(state.job) || !state.start || needEnd || !state.config;
   btn.textContent = state.job ? "Planning…" : !state.start ? "Choose a start" : needEnd ? "Choose a finish" : "Generate routes";
+  $("#clear").disabled = Boolean(state.job);
 }
 
 function showError(message) {
-  const el = $("#form-error");
-  el.textContent = message;
-  el.hidden = false;
+  const box = $("#form-error");
+  box.textContent = message;
+  box.hidden = false;
+  $("#form-note").hidden = true;
 }
 
-function clearError() {
+function showNote(message) {
+  const box = $("#form-note");
+  box.textContent = message;
+  box.hidden = false;
+}
+
+function clearMessages() {
   $("#form-error").hidden = true;
+  $("#form-note").hidden = true;
 }
 
 function markStale() {
-  if (state.result) $("#results-stale").hidden = false;
+  if (state.result && !state.result.saved) $("#results-stale").hidden = false;
 }
 
 // ---------- searching ----------
@@ -430,7 +529,7 @@ async function generate(e) {
   e.preventDefault();
   const oneway = state.routeType === "oneway";
   if (state.job || !state.start || (oneway && !state.end)) return;
-  clearError();
+  clearMessages();
   setPick(null);
   const o = state.options;
   const body = {
@@ -446,7 +545,7 @@ async function generate(e) {
   };
   state.job = "starting";
   updateGenerate();
-  showProgress({ status: "queued", log: [], elapsed_s: 0 });
+  showProgress({ status: "queued", log: [], elapsed_s: 0, progress: null });
   try {
     const { job } = await api("/api/plan", { method: "POST", body });
     state.lastJob = job;
@@ -469,48 +568,90 @@ function follow(id) {
     try {
       s = await api(`/api/jobs/${id}`);
     } catch (err) {
-      finish(id, null, err.message);
+      finish(id, { status: "error", error: err.message });
       return;
     }
-    showProgress(s);
-    if (s.status === "done") finish(id, s.result);
-    else if (s.status === "error") finish(id, null, s.error);
-    else setTimeout(tick, POLL_MS);
+    if (s.status === "queued" || s.status === "running") {
+      showProgress(s);
+      setTimeout(tick, POLL_MS);
+    } else {
+      finish(id, s);
+    }
   };
   tick();
 }
 
-function finish(id, result, error) {
+function finish(id, s) {
   if (state.job !== id) return;
   state.job = null;
   $("#progress").hidden = true;
+  resetCancel();
   updateGenerate();
-  if (error) showError(error);
-  else showResult(result);
+  if (s.status === "done") {
+    showResult(s.result);
+    refreshConfig();
+  } else if (s.status === "cancelled") {
+    showNote(s.stage === "download" || s.stage === "waiting"
+      ? "Search cancelled. The road data already downloaded is kept, so generating here again carries on from there."
+      : "Search cancelled.");
+    refreshConfig();
+  } else {
+    showError(s.error || "Something went wrong.");
+  }
+}
+
+async function cancelSearch() {
+  const id = state.job;
+  if (!id || id === "starting") return;
+  const btn = $("#cancel");
+  btn.disabled = true;
+  btn.textContent = "Cancelling…";
+  try {
+    await api(`/api/jobs/${id}/cancel`, { method: "POST" });
+  } catch (err) {
+    resetCancel();
+    showError(err.message);
+  }
+}
+
+function resetCancel() {
+  const btn = $("#cancel");
+  btn.disabled = false;
+  btn.textContent = "Cancel";
 }
 
 function showProgress(s) {
   $("#progress").hidden = false;
-  const last = s.log.length ? s.log[s.log.length - 1] : "";
-  $("#progress-text").textContent = s.status === "queued" ? "Waiting for the planner…" : friendly(last) || "Starting…";
+  const p = s.progress;
+  let text;
+  if (s.status === "queued") text = "Waiting for the planner…";
+  else if (p && p.stage === "download" && p.total) text = `Downloading road data: part ${Math.min(p.done + 1, p.total)} of ${p.total}`;
+  else if (p && STAGES[p.stage]) text = STAGES[p.stage];
+  else text = friendly(s.log.length ? s.log[s.log.length - 1] : "") || "Starting…";
+  $("#progress-text").textContent = text;
+  const bar = $("#progress-bar");
+  bar.hidden = !(p && p.total);
+  if (p && p.total) $("#progress-fill").style.width = `${clamp(100 * p.done / p.total, 0, 100)}%`;
+  $("#progress-eta").textContent = p && p.eta_s != null ? `About ${duration(p.eta_s)} left` : "";
   const t = Math.round(s.elapsed_s || 0);
   $("#progress-time").textContent = `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`;
   $("#progress-log").textContent = s.log.join("\n");
 }
 
-// the planner's terminal messages, in plainer words
+// the planner's terminal messages, in plainer words (used before its first progress report)
 function friendly(line) {
-  const tile = /^tile (\d+)\/(\d+)/.exec(line);
-  if (tile) return `Downloading road data: part ${tile[1]} of ${tile[2]}…`;
   if (/^Downloading OpenStreetMap/.test(line)) return "Downloading road data (a one-off for this area)…";
   if (/trying again in/.test(line)) return "OpenStreetMap's servers are busy. Retrying…";
-  if (/^Building road graph/.test(line)) return "Building the road network…";
   if (/^Unzipping/.test(line)) return "Unzipping your Strava export…";
   if (/^Parsing \d+ new activity/.test(line)) return "Reading new activities from your export…";
-  if (/^Matching your GPS history/.test(line)) return "Working out which roads you've done…";
-  if (/candidate waypoint areas|^Searching for the route/.test(line)) return "Searching for the route with the most new road…";
   if (/^Road network:|^Within|activities count towards|^Start:/.test(line)) return "Loading the road network…";
   return line;
+}
+
+async function refreshConfig() {
+  try { state.config = await api("/api/config"); } catch (_) { return; }
+  renderAreas();
+  updateHints();
 }
 
 // ---------- results ----------
@@ -518,20 +659,19 @@ function friendly(line) {
 function showResult(result) {
   state.result = result;
   state.selected = 0;
+  state.context = null;
   $("#results-stale").hidden = true;
+  $("#results-error").hidden = true;
+  $("#results-note").hidden = true;
+  layers.untraveled.clearLayers();
+  layers.traveled.clearLayers();
   drawRoutes();
   renderResults();
+  renderSaved();
   const all = L.latLngBounds(result.routes[0].bounds);
   for (const r of result.routes) all.extend(r.bounds);
   fitMap(all);
   loadContext(result);
-}
-
-// fit the map to bounds, keeping clear of the map key while it's open on a roomy map
-function fitMap(bounds, maxZoom = 16) {
-  const key = $("#legend");
-  const roomy = $("#map").clientWidth > 640 && key.open && key.offsetParent !== null;
-  map.fitBounds(bounds, { paddingTopLeft: [roomy ? key.offsetWidth + 28 : 40, 40], paddingBottomRight: [40, 40], maxZoom });
 }
 
 function select(i) {
@@ -541,89 +681,319 @@ function select(i) {
   renderResults();
 }
 
+function routeLine(route) {
+  const out = [];
+  route.segments.forEach((run, k) => { for (const p of (k === 0 ? run.coords : run.coords.slice(1))) out.push(p); });
+  return out;
+}
+
 function drawRoutes() {
   layers.alts.clearLayers();
   layers.route.clearLayers();
   const res = state.result;
-  if (!res) return;
-  res.routes.forEach((r, i) => {
-    if (i === state.selected) return;
-    L.polyline(r.segments.map((s) => s.coords), {
-      pane: "alts", color: color("--alt"), weight: 5, opacity: 0.5, lineJoin: "round", bubblingMouseEvents: false,
-    })
-      .bindTooltip(`Option ${i + 1}: ${km(r.distance_km)} km, ${km(r.new_km)} km new. Click to show it.`, { sticky: true })
-      .on("click", () => select(i))
-      .on("mouseover", (e) => e.target.setStyle({ opacity: 0.85 }))
-      .on("mouseout", (e) => e.target.setStyle({ opacity: 0.5 }))
-      .addTo(layers.alts);
-  });
-  const sel = res.routes[state.selected];
-  const line = { interactive: false, lineJoin: "round", lineCap: "round" };
-  L.polyline(sel.segments.map((s) => s.coords), { ...line, color: color("--panel"), weight: 9, opacity: 0.9 }).addTo(layers.route);
-  for (const s of sel.segments) {
-    L.polyline(s.coords, { ...line, color: s.new ? color("--new") : color("--done"), weight: 5, opacity: 1 }).addTo(layers.route);
+  if (res) {
+    res.routes.forEach((r, i) => {
+      if (i === state.selected) return;
+      L.polyline(r.segments.map((s) => s.coords), {
+        pane: "alts", color: color("--alt"), weight: 5, opacity: 0.5, lineJoin: "round", bubblingMouseEvents: false,
+      })
+        .bindTooltip(`Option ${i + 1}: ${km(r.distance_km)} km, ${km(r.new_km)} km new. Click to show it.`, { sticky: true })
+        .on("click", () => select(i))
+        .on("mouseover", (e) => e.target.setStyle({ opacity: 0.85 }))
+        .on("mouseout", (e) => e.target.setStyle({ opacity: 0.5 }))
+        .addTo(layers.alts);
+    });
+    const sel = res.routes[state.selected];
+    const line = { interactive: false, lineJoin: "round", lineCap: "round" };
+    L.polyline(sel.segments.map((s) => s.coords), { ...line, color: state.show.aerial ? "#fff" : color("--panel"), weight: 9, opacity: 0.9 })
+      .addTo(layers.route);
+    for (const s of sel.segments) {
+      L.polyline(s.coords, { ...line, color: s.new ? color("--new") : color("--done"), weight: 5, opacity: 1 }).addTo(layers.route);
+    }
+    if (res.saved) { // a saved route's own start and finish (the S/F pins are the form's)
+      const pts = routeLine(sel);
+      const dot = (p, fill) => L.circleMarker(p, { radius: 6, color: "#fff", weight: 2.5, fillColor: fill, fillOpacity: 1, interactive: false });
+      dot(pts[0], "#188038").addTo(layers.route);
+      if (res.route_type === "oneway") dot(pts[pts.length - 1], "#1f2328").addTo(layers.route);
+    }
   }
+  drawMarks();
+}
+
+// direction arrows along the chosen route, and distance markers at round numbers of km
+function drawMarks() {
+  layers.marks.clearLayers();
+  const res = state.result;
+  if (!res) return;
+  const pts = routeLine(res.routes[state.selected]);
+  if (pts.length < 2) return;
+  const cum = [0];
+  for (let i = 1; i < pts.length; i++) {
+    cum.push(cum[i - 1] + 1000 * distanceKm({ lat: pts[i - 1][0], lon: pts[i - 1][1] }, { lat: pts[i][0], lon: pts[i][1] }));
+  }
+  const total = cum[cum.length - 1];
+  const mpp = 156543.03392 * Math.cos(pts[0][0] * Math.PI / 180) / 2 ** map.getZoom(); // metres per pixel
+  const arrowEvery = 90 * mpp;
+  for (let s = arrowEvery / 2; s < total; s += arrowEvery) {
+    const at = pointAt(pts, cum, s);
+    L.marker(at.latlng, { icon: arrowIcon(at.angle), pane: "marks", interactive: false, keyboard: false }).addTo(layers.marks);
+  }
+  const steps = MODES[res.mode].kmMarks;
+  const every = (steps.find((k) => (k * 1000) / mpp >= 70) || steps[steps.length - 1]) * 1000;
+  for (let s = every; s < total - every * 0.25; s += every) {
+    const at = pointAt(pts, cum, s);
+    L.marker(at.latlng, { icon: kmIcon(Math.round(s / 1000)), pane: "marks", interactive: false, keyboard: false }).addTo(layers.marks);
+  }
+}
+
+function pointAt(pts, cum, s) {
+  let a = 0;
+  let b = cum.length - 1;
+  while (b - a > 1) {
+    const mid = (a + b) >> 1;
+    if (cum[mid] <= s) a = mid; else b = mid;
+  }
+  while (b < pts.length - 1 && cum[b] === cum[a]) b++; // step over repeated points, so there's a direction
+  const t = cum[b] > cum[a] ? (s - cum[a]) / (cum[b] - cum[a]) : 0;
+  const latlng = L.latLng(pts[a][0] + (pts[b][0] - pts[a][0]) * t, pts[a][1] + (pts[b][1] - pts[a][1]) * t);
+  const p1 = map.project(pts[a]);
+  const p2 = map.project(pts[b]);
+  return { latlng, angle: Math.atan2(p2.y - p1.y, p2.x - p1.x) * 180 / Math.PI };
+}
+
+function arrowIcon(angle) {
+  return L.divIcon({
+    className: "route-arrow", iconSize: [14, 14], iconAnchor: [7, 7],
+    html: `<svg viewBox="0 0 14 14" style="transform:rotate(${angle.toFixed(0)}deg)"><path d="M4.5 3 9.5 7 4.5 11"/></svg>`,
+  });
+}
+
+function kmIcon(n) {
+  const w = n >= 100 ? 30 : n >= 10 ? 24 : 18;
+  return L.divIcon({ className: "km-mark", html: String(n), iconSize: [w, 17], iconAnchor: [w / 2, 8.5] });
+}
+
+function savedFor(job, index) {
+  return state.saved.find((s) => s.job === job && s.index === index);
 }
 
 function renderResults() {
   const res = state.result;
   $("#results").hidden = !res;
-  if (!res) return;
-  const a = res.area;
-  const where = res.route_type === "loop" ? `within ${km(res.distance_km / 2)} km of the start` : "within reach of the start and finish";
-  $("#results-summary").textContent =
-    `You've done ${nf0.format(a.traveled_km)} of the ${nf0.format(a.total_km)} km of roads ${where} (${nf0.format(a.traveled_pct)}%).`;
+  if (!res) {
+    $("#elevation").hidden = true;
+    return;
+  }
+  if (res.saved) {
+    $("#results-title").textContent = "Saved route";
+    $("#results-summary").textContent = `Saved ${dateFormat.format(new Date(res.saved.saved_at))}.`;
+    $("#results-hint").hidden = true;
+  } else {
+    $("#results-title").textContent = "Suggested routes";
+    const a = res.area;
+    const where = res.route_type === "loop" ? `within ${km(res.distance_km / 2)} km of the start` : "within reach of the start and finish";
+    $("#results-summary").textContent =
+      `You've done ${nf0.format(a.traveled_km)} of the ${nf0.format(a.total_km)} km of roads ${where} (${nf0.format(a.traveled_pct)}%).`;
+    $("#results-hint").hidden = false;
+  }
   $("#route-list").replaceChildren(...res.routes.map(routeCard));
+  renderProfile();
 }
 
 function routeCard(r, i) {
-  const li = document.createElement("li");
-  li.className = `route-card${i === state.selected ? " selected" : ""}`;
-
-  const main = document.createElement("button");
-  main.type = "button";
-  main.className = "route-main";
+  const res = state.result;
+  const li = el("li", { className: `route-card${i === state.selected ? " selected" : ""}` });
+  const main = el("button", { type: "button", className: "route-main" });
   main.setAttribute("aria-pressed", String(i === state.selected));
   main.addEventListener("click", () => select(i));
 
-  const title = document.createElement("span");
-  title.className = "route-title";
-  title.textContent = `Option ${i + 1}`;
-  if (i === 0 && state.result.routes.length > 1) {
-    const badge = document.createElement("span");
-    badge.className = "badge";
-    badge.textContent = "most new road";
-    title.append(badge);
-  }
+  const title = el("span", { className: "route-title", textContent: res.saved ? res.saved.name : `Option ${i + 1}` });
+  if (!res.saved && i === 0 && res.routes.length > 1) title.append(el("span", { className: "badge", textContent: "most new road" }));
+  if (res.saved && res.saved.done) title.append(el("span", { className: "badge done", textContent: "done" }));
 
-  const stats = document.createElement("span");
-  stats.className = "route-stats";
-  const length = document.createElement("strong");
-  length.textContent = `${km(r.distance_km)} km`;
-  stats.append(length, ` · ${km(r.new_km)} km new (${r.new_pct}%)`);
+  const stats = el("span", { className: "route-stats" });
+  stats.append(el("strong", { textContent: `${km(r.distance_km)} km` }),
+    ` · ${km(r.new_km)} km new (${r.new_pct}%)` + (r.ascent_m != null ? ` · ↑ ${nf0.format(r.ascent_m)} m` : ""));
 
-  const bar = document.createElement("span");
-  bar.className = "bar";
-  bar.title = `${r.new_pct}% of the route is new to you`;
-  const fill = document.createElement("span");
-  fill.style.width = `${Math.max(0, Math.min(100, r.new_pct))}%`;
+  const bar = el("span", { className: "bar", title: `${r.new_pct}% of the route is new to you` });
+  const fill = el("span");
+  fill.style.width = `${clamp(r.new_pct, 0, 100)}%`;
   bar.append(fill);
   main.append(title, stats, bar);
 
-  const gpx = document.createElement("a");
-  gpx.className = "gpx-btn";
-  gpx.href = r.gpx_url;
-  gpx.setAttribute("download", "");
-  gpx.title = "Download as GPX, for a bike computer, watch or route app";
-  gpx.innerHTML = '<svg class="i" aria-hidden="true"><use href="#i-download"/></svg>GPX';
-
-  li.append(main, gpx);
+  const actions = el("div", { className: "route-actions" });
+  actions.append(gpxLink(r.gpx_url));
+  if (!res.saved) {
+    const already = savedFor(res.job, i);
+    const saveBtn = miniButton(already ? "Saved" : "Save", "save", () => saveRoute(i, saveBtn),
+      already ? `Saved as "${already.name}"` : "Keep this route in your saved routes");
+    saveBtn.disabled = Boolean(already);
+    actions.append(saveBtn);
+    if (res.route_type === "loop") {
+      const rev = miniButton("Reverse", "reverse", () => reverseRoute(i, rev), "Go round the loop the other way");
+      actions.append(rev);
+    }
+  }
+  li.append(main, actions);
   return li;
 }
 
+function showResultsError(message) {
+  const box = $("#results-error");
+  box.textContent = message;
+  box.hidden = false;
+}
+
+async function saveRoute(i, btn) {
+  const res = state.result;
+  btn.disabled = true;
+  try {
+    await api("/api/saved", { method: "POST", body: { job: res.job, index: i } });
+    await loadSaved();
+    if (state.result === res) renderResults();
+  } catch (err) {
+    btn.disabled = false;
+    showResultsError(err.message);
+  }
+}
+
+async function reverseRoute(i, btn) {
+  const res = state.result;
+  btn.disabled = true;
+  $("#results-error").hidden = true;
+  $("#results-note").hidden = true;
+  try {
+    const route = await api(`/api/jobs/${res.job}/routes/${i}/reverse`, { method: "POST" });
+    if (state.result !== res) return;
+    res.routes[i] = route;
+    state.selected = i;
+    drawRoutes();
+    renderResults();
+    const note = $("#results-note");
+    note.textContent = route.detour_km > 0
+      ? `Option ${i + 1} now goes the other way round. One-way streets add ${km(route.detour_km)} km of detours.`
+      : `Option ${i + 1} now goes the other way round.`;
+    note.hidden = false;
+  } catch (err) {
+    btn.disabled = false;
+    showResultsError(err.message);
+  }
+}
+
+// ---------- elevation profile ----------
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function svgEl(tag, attrs = {}) {
+  const node = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  return node;
+}
+
+function renderProfile() {
+  const box = $("#elevation");
+  const chart = $("#elevation-chart");
+  layers.hover.clearLayers();
+  const res = state.result;
+  const route = res && res.routes[state.selected];
+  if (!route) { box.hidden = true; return; }
+  box.hidden = false;
+  chart.replaceChildren();
+  const prof = route.profile;
+  if (!prof) {
+    $("#elevation-stats").textContent = "";
+    $("#elevation-note").textContent = "Elevation isn't available for this route: its data couldn't be downloaded.";
+    return;
+  }
+  $("#elevation-stats").textContent = `↑ ${nf0.format(prof.ascent_m)} m   ↓ ${nf0.format(prof.descent_m)} m`;
+  $("#elevation-note").textContent = "Point at the chart to find that spot on the map.";
+
+  const W = chart.clientWidth || 340;
+  const H = 130;
+  const pad = { l: 38, r: 6, t: 8, b: 18 };
+  const n = prof.km.length;
+  const maxKm = prof.km[n - 1] || 1;
+  let lo = Math.floor(prof.min_m / 10) * 10;
+  let hi = Math.ceil(prof.max_m / 10) * 10;
+  if (hi - lo < 40) { lo = Math.floor(((hi + lo) / 2 - 20) / 10) * 10; hi = lo + 40; }
+  const x = (k) => pad.l + (k / maxKm) * (W - pad.l - pad.r);
+  const y = (m) => pad.t + (1 - (m - lo) / (hi - lo)) * (H - pad.t - pad.b);
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": `Elevation from ${prof.min_m} to ${prof.max_m} m, with ${prof.ascent_m} m of climbing` });
+
+  for (const m of [lo, (lo + hi) / 2, hi]) {
+    svg.append(svgEl("line", { class: "grid", x1: pad.l, x2: W - pad.r, y1: y(m), y2: y(m) }));
+    const label = svgEl("text", { class: "axis", x: pad.l - 5, y: y(m) + 3.5, "text-anchor": "end" });
+    label.textContent = `${nf0.format(m)} m`;
+    svg.append(label);
+  }
+  for (const k of [0, maxKm / 2, maxKm]) {
+    const label = svgEl("text", { class: "axis", x: x(k), y: H - 3, "text-anchor": k === 0 ? "start" : k === maxKm ? "end" : "middle" });
+    label.textContent = `${km(k)} km`;
+    svg.append(label);
+  }
+  let d = `M${x(0)},${y(lo)}`;
+  for (let i = 0; i < n; i++) d += `L${x(prof.km[i]).toFixed(1)},${y(prof.m[i]).toFixed(1)}`;
+  svg.append(svgEl("path", { class: "area", d: `${d}L${x(maxKm)},${y(lo)}Z` }));
+  // the line, red where the road is new and blue where it's done, as on the map
+  let from = 0;
+  for (let i = 1; i <= n; i++) {
+    if (i < n && prof.new[i] === prof.new[from]) continue;
+    const points = [];
+    for (let j = Math.max(0, from - 1); j < i; j++) points.push(`${x(prof.km[j]).toFixed(1)},${y(prof.m[j]).toFixed(1)}`);
+    svg.append(svgEl("polyline", { points: points.join(" "), fill: "none", "stroke-width": 2, "stroke-linejoin": "round",
+      stroke: prof.new[from] ? color("--new") : color("--done") }));
+    from = i;
+  }
+
+  const guide = svgEl("line", { class: "guide", y1: pad.t, y2: H - pad.b, visibility: "hidden" });
+  const dot = svgEl("circle", { r: 3.5, fill: color("--text"), visibility: "hidden" });
+  const readout = svgEl("text", { class: "readout", y: pad.t + 10, visibility: "hidden" });
+  const hit = svgEl("rect", { x: pad.l, y: 0, width: W - pad.l - pad.r, height: H, fill: "transparent" });
+  svg.append(guide, dot, readout, hit);
+  const showAt = (clientX) => {
+    const r = svg.getBoundingClientRect();
+    const target = clamp((((clientX - r.left) * (W / r.width)) - pad.l) / (W - pad.l - pad.r), 0, 1) * maxKm;
+    let a = 0;
+    let b = n - 1;
+    while (b - a > 1) {
+      const mid = (a + b) >> 1;
+      if (prof.km[mid] <= target) a = mid; else b = mid;
+    }
+    const i = target - prof.km[a] <= prof.km[b] - target ? a : b;
+    const gx = x(prof.km[i]);
+    guide.setAttribute("x1", gx);
+    guide.setAttribute("x2", gx);
+    dot.setAttribute("cx", gx);
+    dot.setAttribute("cy", y(prof.m[i]));
+    const right = gx > W * 0.6;
+    readout.setAttribute("x", right ? gx - 6 : gx + 6);
+    readout.setAttribute("text-anchor", right ? "end" : "start");
+    readout.textContent = `${km(prof.km[i])} km · ${nf0.format(prof.m[i])} m`;
+    for (const node of [guide, dot, readout]) node.setAttribute("visibility", "visible");
+    showHover(prof.lat[i], prof.lon[i]);
+  };
+  const hide = () => {
+    for (const node of [guide, dot, readout]) node.setAttribute("visibility", "hidden");
+    layers.hover.clearLayers();
+  };
+  hit.addEventListener("pointermove", (e) => showAt(e.clientX));
+  hit.addEventListener("pointerdown", (e) => showAt(e.clientX));
+  hit.addEventListener("pointerleave", hide);
+  chart.append(svg);
+}
+
+function showHover(lat, lon) {
+  layers.hover.clearLayers();
+  L.circleMarker([lat, lon], {
+    radius: 7, color: "#fff", weight: 3, fillColor: "#1f2328", fillOpacity: 1, interactive: false,
+  }).addTo(layers.hover);
+}
+
+// ---------- roads around the routes ----------
+
 async function loadContext(result) {
-  layers.untraveled.clearLayers();
-  layers.traveled.clearLayers();
+  if (!result.context_url) return; // saved routes don't have them
   let ctx;
   try {
     ctx = await api(result.context_url);
@@ -631,29 +1001,206 @@ async function loadContext(result) {
     console.warn("Couldn't load the roads around the route:", err.message);
     return;
   }
-  if (state.result !== result) return; // a newer search has finished since
-  // kept faint: when most roads around are new, this layer covers everything and must not drown the route
-  const line = { renderer: contextRenderer, interactive: false, weight: 1.4, lineJoin: "round" };
+  if (state.result !== result) return; // a newer result is on show
+  state.context = ctx;
+  drawContext();
+}
+
+function drawContext() {
+  layers.untraveled.clearLayers();
+  layers.traveled.clearLayers();
+  const ctx = state.context;
+  if (!ctx) return;
+  // the new roads are kept faint, as when most roads around are new they'd drown the route;
+  // the done roads are bolder, in a colour that stands out from the map
+  const line = { renderer: contextRenderer, interactive: false, lineJoin: "round" };
   if (ctx.untraveled.length) {
-    L.polyline(ctx.untraveled, { ...line, color: color("--untraveled"), opacity: 0.55, dashArray: "3 5" }).addTo(layers.untraveled);
+    L.polyline(ctx.untraveled, { ...line, weight: 1.4, color: color("--untraveled"),
+      opacity: state.show.aerial ? 0.85 : 0.55, dashArray: "3 5" }).addTo(layers.untraveled);
   }
   if (ctx.traveled.length) {
-    L.polyline(ctx.traveled, { ...line, color: color("--traveled"), opacity: 0.5 }).addTo(layers.traveled);
+    L.polyline(ctx.traveled, { ...line, weight: 2.4, color: color("--traveled"), opacity: 0.9 }).addTo(layers.traveled);
   }
+}
+
+// ---------- saved routes ----------
+
+async function loadSaved() {
+  try {
+    state.saved = (await api("/api/saved")).routes;
+  } catch (err) {
+    savedError(err.message);
+  }
+  renderSaved();
+}
+
+function savedError(message) {
+  const box = $("#saved-error");
+  box.textContent = message;
+  box.hidden = !message;
+}
+
+function renderSaved() {
+  $("#saved-count").textContent = state.saved.length ? `(${state.saved.length})` : "";
+  $("#saved-empty").hidden = state.saved.length > 0;
+  const showing = state.result && state.result.saved ? state.result.saved.id : null;
+  $("#saved-list").replaceChildren(...state.saved.map((s) => savedItem(s, s.id === showing)));
+}
+
+function savedItem(s, showing) {
+  const li = el("li", { className: `saved-item${showing ? " showing" : ""}` });
+  const name = el("div", { className: "saved-name" });
+  if (state.renaming === s.id) {
+    const input = el("input", { type: "text", value: s.name, maxLength: 80 });
+    input.setAttribute("aria-label", "Route name");
+    let finished = false;
+    const commit = (keep) => {
+      if (finished) return;
+      finished = true;
+      state.renaming = null;
+      const value = input.value.trim();
+      if (keep && value && value !== s.name) updateSaved(s.id, { name: value });
+      else renderSaved();
+    };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commit(true); }
+      if (e.key === "Escape") commit(false);
+    });
+    input.addEventListener("blur", () => commit(true));
+    name.append(input);
+    setTimeout(() => { input.focus(); input.select(); });
+  } else {
+    name.append(document.createTextNode(s.name));
+    if (s.done) name.append(el("span", { className: "badge done", textContent: "done" }));
+  }
+  const meta = [
+    `${s.mode === "run" ? "Run" : "Ride"} ${s.route_type === "loop" ? "loop" : "A → B"}`,
+    `${km(s.distance_km)} km`,
+    `${km(s.new_km)} km new`,
+    s.ascent_m != null ? `↑ ${nf0.format(s.ascent_m)} m` : null,
+    s.saved_at ? dateFormat.format(new Date(s.saved_at)) : null,
+  ].filter(Boolean).join(" · ");
+
+  const actions = el("div", { className: "route-actions" });
+  actions.append(miniButton("Show", "eye", () => showSaved(s.id), "Show this route on the map"));
+  actions.append(gpxLink(`/api/saved/${s.id}.gpx`));
+  actions.append(miniButton("Rename", "edit", () => { state.renaming = s.id; renderSaved(); }));
+  const done = miniButton(s.done ? "Done" : "Mark done", "check", () => updateSaved(s.id, { done: !s.done }),
+    s.done ? "You've done this one. Click to undo." : "Mark it as ridden or run");
+  done.setAttribute("aria-pressed", String(Boolean(s.done)));
+  actions.append(done);
+  const del = miniButton("Delete", "trash", () => {
+    if (!del.classList.contains("danger")) { // ask once more, without a pop-up
+      del.classList.add("danger");
+      del.lastChild.textContent = "Delete?";
+      setTimeout(() => { del.classList.remove("danger"); del.lastChild.textContent = "Delete"; }, 4000);
+      return;
+    }
+    deleteSaved(s.id);
+  }, "Delete this saved route");
+  actions.append(del);
+  li.append(name, el("span", { className: "saved-meta", textContent: meta }), actions);
+  return li;
+}
+
+async function updateSaved(id, changes) {
+  savedError("");
+  try {
+    const updated = await api(`/api/saved/${id}`, { method: "PATCH", body: changes });
+    if (state.result && state.result.saved && state.result.saved.id === id) {
+      Object.assign(state.result.saved, { name: updated.name, done: updated.done });
+      renderResults();
+    }
+  } catch (err) {
+    savedError(err.message);
+  }
+  await loadSaved();
+}
+
+async function deleteSaved(id) {
+  savedError("");
+  try {
+    await api(`/api/saved/${id}`, { method: "DELETE" });
+    if (state.result && state.result.saved && state.result.saved.id === id) clearRoutes();
+  } catch (err) {
+    savedError(err.message);
+  }
+  await loadSaved();
+  if (state.result) renderResults(); // a suggestion's "Saved" button may be free again
+}
+
+async function showSaved(id) {
+  savedError("");
+  let s;
+  try {
+    s = await api(`/api/saved/${id}`);
+  } catch (err) {
+    savedError(err.message);
+    return;
+  }
+  clearMessages();
+  showResult({
+    saved: { id, name: s.name, saved_at: s.saved_at, done: s.done },
+    mode: s.mode, route_type: s.route_type, distance_km: s.distance_km, start: s.start, end: s.end,
+    routes: [{
+      index: 0, distance_km: s.distance_km, new_km: s.new_km, new_pct: s.new_pct, ascent_m: s.ascent_m,
+      bounds: s.bounds, segments: s.segments, profile: s.profile, gpx_url: `/api/saved/${id}.gpx`,
+    }],
+  });
+}
+
+// ---------- clearing ----------
+
+function clearRoutes() {
+  state.result = null;
+  state.context = null;
+  state.selected = 0;
+  for (const k of ["alts", "route", "marks", "hover", "untraveled", "traveled"]) layers[k].clearLayers();
+  $("#results-stale").hidden = true;
+  $("#results-error").hidden = true;
+  renderResults();
+  renderSaved();
+}
+
+// back to a clean slate: no routes or finish, the start back at your usual start (settings stay)
+function clearAll() {
+  if (state.job) return;
+  setPick(null);
+  map.closePopup();
+  clearRoutes();
+  clearMessages();
+  state.lastJob = null;
+  state.end = null;
+  state.start = usualStart();
+  for (const w of ["start", "end"]) {
+    $(`#${w}-q`).value = "";
+    $(`#${w}-results`).hidden = true;
+  }
+  renderPlaces();
+  updateHints();
+  save();
+  initialView();
+}
+
+function resetOptions() {
+  state.options = { ...DEFAULT_OPTIONS };
+  applyStateToUI();
+  markStale();
+  save();
 }
 
 // ---------- start-up ----------
 
 function renderStatus() {
   const c = state.config;
-  const el = $("#status");
+  const box = $("#status");
   if (c.export_problem) {
-    el.className = "status warn";
-    el.textContent = `No Strava history loaded, so every road counts as new. ${c.export_problem}`;
+    box.className = "status warn";
+    box.textContent = `No Strava history loaded, so every road counts as new. ${c.export_problem}`;
     return;
   }
-  el.className = "status";
-  el.textContent = `Using your Strava history: ${nf0.format(c.activities.ride)} rides, and ` +
+  box.className = "status";
+  box.textContent = `Using your Strava history: ${nf0.format(c.activities.ride)} rides, and ` +
     `${nf0.format(c.activities.run)} runs, walks and hikes.`;
 }
 
@@ -711,6 +1258,7 @@ function bindUI() {
   document.querySelectorAll("[data-pick]").forEach((b) => b.addEventListener("click", () => {
     setPick(state.pick === b.dataset.pick ? null : b.dataset.pick);
   }));
+  document.querySelectorAll("[data-base]").forEach((b) => b.addEventListener("click", () => setBase(b.dataset.base)));
   $("#pick-cancel").addEventListener("click", () => setPick(null));
   $("#usual-start").addEventListener("click", useUsualStart);
   $("#locate").addEventListener("click", locate);
@@ -726,6 +1274,9 @@ function bindUI() {
   }
   $("#legend").addEventListener("toggle", (e) => { state.show.key = e.target.open; save(); });
   $("#plan-form").addEventListener("submit", generate);
+  $("#cancel").addEventListener("click", cancelSearch);
+  $("#clear").addEventListener("click", clearAll);
+  $("#reset-options").addEventListener("click", resetOptions);
 
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && state.pick) setPick(null); });
   document.addEventListener("click", (e) => { // close search suggestions when clicking elsewhere
@@ -734,24 +1285,23 @@ function bindUI() {
       if (!list.hidden && !e.target.closest(`#${which}-results, [data-search="${which}"], #${which}-q`)) list.hidden = true;
     }
   });
-  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
-    renderAreas();
-    drawRoutes();
-    if (state.result) loadContext(state.result);
-  });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", restyle);
+  let resizeTimer = 0;
+  window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderProfile, 150); });
 }
 
 async function init() {
   restore();
   bindUI();
+  setBase(state.show.aerial ? "aerial" : "map");
   applyStateToUI();
   initialView();
   try {
     state.config = await api("/api/config");
   } catch (err) {
-    const el = $("#status");
-    el.className = "status error";
-    el.textContent = err.message;
+    const box = $("#status");
+    box.className = "status error";
+    box.textContent = err.message;
     return;
   }
   renderStatus();
@@ -762,6 +1312,7 @@ async function init() {
   }
   initialView();
   updateHints();
+  await loadSaved();
   resume();
 }
 

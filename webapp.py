@@ -8,7 +8,8 @@ so next time `.venv/bin/python webapp.py` is enough.
 
 Everything runs on your computer: the page only talks to this local server,
 which runs the same planner as newroutes.py. The outside services involved are
-OpenStreetMap's map tiles, road data downloads (Overpass) and place search
+map tiles (OpenStreetMap, and Esri for the aerial view), road data downloads
+(Overpass), elevation data (the AWS Terrain Tiles open dataset) and place search
 (Nominatim). Only Python's standard library is needed on top of requirements.txt.
 """
 from __future__ import annotations
@@ -35,23 +36,28 @@ warnings.filterwarnings("ignore", message=".*OpenSSL.*")
 
 import numpy as np  # noqa: E402
 
+import elevation  # noqa: E402
 import export  # noqa: E402
 import pipeline  # noqa: E402
+import progress  # noqa: E402
 import roads  # noqa: E402
+import saved  # noqa: E402
+import planner  # noqa: E402
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(HERE, "web")
 KEEP_JOBS = 12          # finished searches kept for GPX downloads (each holds its routes)
 MAX_BODY = 64 * 1024
 EFFORT = {"quick": (4, 20), "normal": (8, 40), "thorough": (16, 80)}  # (restarts, iterations)
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
+FINISHED = ("done", "error", "cancelled")
 CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
                  ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png"}
 CSP = ("default-src 'self'; script-src 'self' https://unpkg.com; "
        "style-src 'self' 'unsafe-inline' https://unpkg.com; "
-       "img-src 'self' data: https://tile.openstreetmap.org https://unpkg.com; connect-src 'self'; "
-       "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+       "img-src 'self' data: https://tile.openstreetmap.org https://server.arcgisonline.com https://unpkg.com; "
+       "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 
 
 class ApiError(Exception):
@@ -67,7 +73,7 @@ class Job:
     def __init__(self, request: pipeline.RouteRequest):
         self.id = uuid.uuid4().hex[:12]
         self.request = request
-        self.status = "queued"  # -> running -> done | error
+        self.status = "queued"  # -> running -> done | error | cancelled
         self.log: list[str] = []
         self.created = time.time()
         self.started: float | None = None
@@ -76,6 +82,13 @@ class Job:
         self.summary: dict | None = None
         self.error: str | None = None
         self.context: bytes | None = None
+        self.cancel_event = threading.Event()
+        self.stage: str | None = None  # what the planner is doing, from progress.report()
+        self.done: float | None = None
+        self.total: float | None = None
+        self.stage_started = self.last_step_at = 0.0
+        self.stage_done0 = 0.0
+        self.typical_tile_s = roads.DEFAULT_TILE_SECONDS
         self._partial = ""
 
     def write(self, text: str) -> None:
@@ -86,14 +99,44 @@ class Job:
             self.log.extend(s.strip() for s in lines if s.strip())
             del self.log[:-200]
 
+    def on_progress(self, stage: str, done, total) -> None:
+        now = time.time()
+        if stage != self.stage:
+            self.stage, self.stage_started, self.last_step_at = stage, now, now
+            self.stage_done0 = done or 0
+        elif done is not None and self.done is not None and done > self.done:
+            self.last_step_at = now
+        self.done, self.total = done, total
+
+    def eta_s(self) -> float | None:
+        """Rough seconds left in the current stage, where that can be judged."""
+        if self.total is None or self.done is None:
+            return None
+        now, left = time.time(), self.total - self.done
+        if self.stage == "download":
+            finished_here = self.done - self.stage_done0
+            per_tile = ((self.last_step_at - self.stage_started) / finished_here if finished_here > 0
+                        else self.typical_tile_s)
+            in_progress = now - self.last_step_at  # already spent on the tile being fetched
+            return max(left * per_tile - in_progress, 0) + self.total * pipeline.BUILD_SECONDS_PER_TILE
+        if self.stage == "search" and self.done > 0:
+            return left * (now - self.stage_started) / self.done
+        return None
+
     def status_json(self) -> dict:
         now = self.finished or time.time()
         out = {"id": self.id, "status": self.status, "log": self.log[-40:],
-               "elapsed_s": round(now - (self.started or now), 1)}
+               "elapsed_s": round(now - (self.started or now), 1), "progress": None}
+        if self.stage and self.status == "running":
+            eta = self.eta_s()
+            out["progress"] = {"stage": self.stage, "done": self.done, "total": self.total,
+                               "eta_s": None if eta is None else round(eta)}
         if self.status == "done":
             out["result"] = self.summary
         elif self.status == "error":
             out["error"] = self.error
+        elif self.status == "cancelled":
+            out["stage"] = self.stage  # what it was doing when stopped
         return out
 
 
@@ -129,6 +172,8 @@ class App:
     def __init__(self, ws: pipeline.Workspace, export_problem: str | None = None):
         self.ws = ws
         self.export_problem = export_problem
+        self.elevation = elevation.Elevation(ws.cache_dir)
+        self.saved = saved.SavedRoutes(ws.cache_dir)
         self.jobs: OrderedDict[str, Job] = OrderedDict()
         self.lock = threading.Lock()
         self.queue: queue.Queue[Job] = queue.Queue()
@@ -144,7 +189,7 @@ class App:
         job = Job(req)
         with self.lock:
             self.jobs[job.id] = job
-            finished = [j for j in self.jobs.values() if j.status in ("done", "error")]
+            finished = [j for j in self.jobs.values() if j.status in FINISHED]
             for old in finished[:max(0, len(self.jobs) - KEEP_JOBS)]:
                 del self.jobs[old.id]
         self.queue.put(job)
@@ -156,6 +201,12 @@ class App:
             raise ApiError(404, "That route search has expired. Generate the routes again.")
         return job
 
+    def finished_job(self, job_id: str) -> Job:
+        job = self.job(job_id)
+        if job.status != "done":
+            raise ApiError(409, "That route search hasn't finished.")
+        return job
+
     def active_job(self) -> str | None:
         """The search being worked on (or waiting), so a reloaded page can pick it up again."""
         for j in list(self.jobs.values()):
@@ -163,17 +214,32 @@ class App:
                 return j.id
         return None
 
+    def cancel(self, job_id: str) -> dict:
+        job = self.job(job_id)
+        if job.status == "queued":
+            job.status, job.finished = "cancelled", time.time()
+        elif job.status == "running":
+            job.cancel_event.set()  # the planner stops at its next check, within a second or so
+        return job.status_json()
+
     def _worker(self):
         while True:
-            self._run(self.queue.get())
+            job = self.queue.get()
+            if job.status == "queued":  # skip searches cancelled while they waited
+                self._run(job)
 
     def _run(self, job: Job):
         self.tee.local.job = job
         job.status, job.started = "running", time.time()
+        job.typical_tile_s = roads.typical_tile_seconds(self.ws.cache_dir)
         try:
-            job.result = self.ws.plan(job.request)
-            job.summary = summarise(job)
+            with progress.track(job.on_progress, job.cancel_event):
+                job.result = self.ws.plan(job.request)
+                job.summary = summarise(job, self.elevation)
             job.status = "done"
+        except progress.Cancelled:
+            print("Search cancelled.")
+            job.status = "cancelled"
         except pipeline.PlannerError as exc:
             job.error, job.status = str(exc), "error"
         except Exception as exc:  # show it on the page, with the details in the terminal
@@ -189,18 +255,19 @@ class App:
 # --- JSON payloads ---------------------------------------------------------------------
 
 
-def parse_route_request(body: dict) -> pipeline.RouteRequest:
-    def point(value, label):
-        if value is None:
-            return None
-        try:
-            lat, lon = float(value["lat"]), float(value["lon"])
-        except (TypeError, KeyError, ValueError):
-            raise ApiError(400, f'The {label} should look like {{"lat": 51.5007, "lon": -0.1246}}.')
-        if not (math.isfinite(lat) and math.isfinite(lon)):
-            raise ApiError(400, f"The {label} isn't a valid latitude/longitude.")
-        return lat, lon
+def parse_point(value, label):
+    if value is None:
+        return None
+    try:
+        lat, lon = float(value["lat"]), float(value["lon"])
+    except (TypeError, KeyError, ValueError):
+        raise ApiError(400, f'The {label} should look like {{"lat": 51.5007, "lon": -0.1246}}.')
+    if not (math.isfinite(lat) and math.isfinite(lon) and abs(lat) <= 90 and abs(lon) <= 180):
+        raise ApiError(400, f"The {label} isn't a valid latitude/longitude.")
+    return lat, lon
 
+
+def parse_route_request(body: dict) -> pipeline.RouteRequest:
     def number(name, default, cast=float):
         try:
             value = cast(body.get(name, default))
@@ -217,8 +284,8 @@ def parse_route_request(body: dict) -> pipeline.RouteRequest:
     req = pipeline.RouteRequest(
         mode=str(body.get("mode", "ride")),
         distance_km=number("distance_km", 40.0),
-        start=point(body.get("start"), "start"),
-        end=point(body.get("end"), "finish"),
+        start=parse_point(body.get("start"), "start"),
+        end=parse_point(body.get("end"), "finish"),
         alternatives=number("alternatives", 3, int),
         eagerness=number("eagerness", 0.6),
         avoid_main_roads=number("avoid_main_roads", 1.0),
@@ -232,27 +299,47 @@ def parse_route_request(body: dict) -> pipeline.RouteRequest:
     return req
 
 
-def summarise(job: Job) -> dict:
-    """The finished search as the page draws it: every route split into new / done runs."""
+def elevation_profile(segments: list[dict], elev: elevation.Elevation, download: bool = True) -> dict | None:
+    try:
+        return elevation.profile(segments, elev, download=download)
+    except (elevation.ElevationUnavailable, OSError, ValueError) as exc:  # not Cancelled: that stops the search
+        print(f"No elevation for this route: {exc}.")
+        return None
+
+
+def route_json(job: Job, i: int, elev: elevation.Elevation, download: bool = True) -> dict:
+    """One route as the page draws it: split into new and done runs, with its elevation."""
+    res = job.result
+    plan = res.plans[i]
+    segments = export.route_segments(res.graph, plan, res.new_len)
+    lats = [p[0] for s in segments for p in s["coords"]]
+    lons = [p[1] for s in segments for p in s["coords"]]
+    profile = elevation_profile(segments, elev, download)
+    km, new_km = plan.length_m / 1000, plan.new_m / 1000
+    return {
+        "index": i,
+        "distance_km": round(km, 2),
+        "new_km": round(new_km, 2),
+        "new_pct": round(100 * new_km / km) if km else 0,
+        "ascent_m": profile["ascent_m"] if profile else None,
+        "targets": len(plan.waypoints),
+        "bounds": [[min(lats), min(lons)], [max(lats), max(lons)]],
+        "segments": segments,
+        "profile": profile,
+        "gpx_url": f"/api/jobs/{job.id}/routes/{i}.gpx",
+    }
+
+
+def summarise(job: Job, elev: elevation.Elevation) -> dict:
     res = job.result
     routes = []
-    for i, plan in enumerate(res.plans):
-        segments = export.route_segments(res.graph, plan, res.new_len)
-        lats = [p[0] for s in segments for p in s["coords"]]
-        lons = [p[1] for s in segments for p in s["coords"]]
-        km, new_km = plan.length_m / 1000, plan.new_m / 1000
-        routes.append({
-            "index": i,
-            "distance_km": round(km, 2),
-            "new_km": round(new_km, 2),
-            "new_pct": round(100 * new_km / km) if km else 0,
-            "targets": len(plan.waypoints),
-            "bounds": [[min(lats), min(lons)], [max(lats), max(lons)]],
-            "segments": segments,
-            "gpx_url": f"/api/jobs/{job.id}/routes/{i}.gpx",
-        })
+    for i in range(len(res.plans)):
+        if i == 0:
+            print("Adding elevation...")
+        routes.append(route_json(job, i, elev))
     req = res.request
     return {
+        "job": job.id,
         "mode": req.mode,
         "route_type": "loop" if res.end is None else "oneway",
         "distance_km": req.distance_km,
@@ -277,17 +364,60 @@ def context_json(job: Job) -> bytes:
     return job.context
 
 
-def gpx_download(job: Job, index: int) -> tuple[str, bytes]:
-    res = job.result
-    if not 0 <= index < len(res.plans):
+def route_index(job: Job, index: int) -> int:
+    if not 0 <= index < len(job.result.plans):
         raise ApiError(404, "No such route.")
-    plan, mode = res.plans[index], res.request.mode
+    return index
+
+
+def gpx_text(job: Job, index: int, elev: elevation.Elevation) -> tuple[str, str]:
+    """(file name, GPX) for one of a search's routes, with elevation if it's been downloaded."""
+    res = job.result
+    plan, mode = res.plans[route_index(job, index)], res.request.mode
     km, new_km = plan.length_m / 1000, plan.new_m / 1000
     option = "" if index == 0 else f" #{index + 1}"
-    xml = export.gpx_xml(res.graph, plan, name=f"New roads {mode} {km:.1f} km ({new_km:.1f} new){option}")
+    xml = export.gpx_xml(res.graph, plan, name=f"New roads {mode} {km:.1f} km ({new_km:.1f} new){option}",
+                         heights=lambda lats, lons: elev.heights(lats, lons, download=False))
     stamp = time.strftime("%Y%m%d-%H%M", time.localtime(job.created))
-    filename = f"{mode}_{km:.0f}km_{stamp}_option{index + 1}.gpx"
-    return filename, xml.encode()
+    return f"{mode}_{km:.0f}km_{stamp}_option{index + 1}.gpx", xml
+
+
+def reverse_route(job: Job, index: int, elev: elevation.Elevation) -> dict:
+    """Turn a loop around, going round any one-way stretches by the shortest legal detour."""
+    res = job.result
+    index = route_index(job, index)
+    if res.end is not None:
+        raise ApiError(400, "Only loops can be reversed. For an A → B route, swap the start and finish "
+                            "and generate again.")
+    try:
+        plan, extra_m = planner.reverse_loop(res.graph, res.plans[index], res.new_len)
+    except planner.OneWay as exc:
+        raise ApiError(409, f"This loop can't be ridden the other way: {exc} is one-way, with no short way round.")
+    res.plans[index] = plan
+    route = route_json(job, index, elev, download=False)
+    job.summary["routes"][index] = route
+    return dict(route, detour_km=round(extra_m / 1000, 2))
+
+
+def save_route(app: App, body: dict) -> dict:
+    job = app.finished_job(str(body.get("job", "")))
+    try:
+        index = route_index(job, int(body.get("index", -1)))
+    except (TypeError, ValueError):
+        raise ApiError(400, "index should be a number.")
+    route, summary = job.summary["routes"][index], job.summary
+    _, gpx = gpx_text(job, index, app.elevation)
+    default = (f"{summary['mode'].title()} {'loop' if summary['route_type'] == 'loop' else 'A → B'} · "
+               f"{route['distance_km']:.1f} km")
+    record = {
+        "name": saved.clean_name(body.get("name")) or default,
+        "mode": summary["mode"], "route_type": summary["route_type"],
+        "distance_km": route["distance_km"], "new_km": route["new_km"], "new_pct": route["new_pct"],
+        "ascent_m": route["ascent_m"], "start": summary["start"], "end": summary["end"],
+        "bounds": route["bounds"], "segments": route["segments"], "profile": route["profile"],
+        "job": job.id, "index": index,
+    }
+    return app.saved.add(record, gpx)
 
 
 def config_json(app: App) -> dict:
@@ -305,6 +435,33 @@ def config_json(app: App) -> dict:
         "areas": [{k: a[k] for k in ("mode", "lat", "lon", "radius_m")} for a in roads.cached_areas(ws.cache_dir)],
         "active_job": app.active_job(),
     }
+
+
+def estimate_json(app: App, query: dict) -> dict:
+    def arg(name):
+        return (query.get(name) or [""])[0].strip()
+
+    def point(name, label):
+        text = arg(name)
+        if not text:
+            return None
+        try:
+            lat, lon = (float(v) for v in text.split(","))
+        except ValueError:
+            raise ApiError(400, f"{name} should look like 51.5007,-0.1246.")
+        return parse_point({"lat": lat, "lon": lon}, label)
+
+    mode = arg("mode")
+    if mode not in pipeline.MODES:
+        raise ApiError(400, f"mode should be one of: {', '.join(pipeline.MODES)}.")
+    try:
+        distance = float(arg("distance_km"))
+    except ValueError:
+        raise ApiError(400, "distance_km should be a number.")
+    start = point("start", "start")
+    if start is None or not (math.isfinite(distance) and 0.5 <= distance <= 400):
+        raise ApiError(400, "Give a start and a distance between 0.5 and 400 km.")
+    return app.ws.estimate(mode, start, point("end", "finish"), distance)
 
 
 def geocode_json(app: App, query: dict) -> dict:
@@ -339,6 +496,9 @@ def _json_default(o):
 
 # --- HTTP ----------------------------------------------------------------------------
 
+JOB = r"/api/jobs/([0-9a-f]{12})"
+SAVED = r"/api/saved/([0-9a-f]{12})"
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = f"NewRoadsPlanner/{VERSION}"
@@ -353,12 +513,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._handle(self._post)
 
+    def do_PATCH(self):
+        self._handle(self._patch)
+
+    def do_DELETE(self):
+        self._handle(self._delete)
+
     def _handle(self, fn):
         try:
             self._check_host()
             fn(urlparse(self.path))
         except ApiError as exc:
             self._json({"error": exc.message}, exc.status)
+        except saved.NotFound:
+            self._json({"error": "That saved route doesn't exist any more."}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception:
@@ -366,32 +534,59 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "Internal error. The terminal running webapp.py has the details."}, 500)
 
     def _get(self, url):
-        path = url.path
+        app, path = self.app, url.path
         if path == "/api/config":
-            return self._json(config_json(self.app))
+            return self._json(config_json(app))
         if path == "/api/geocode":
-            return self._json(geocode_json(self.app, parse_qs(url.query)))
-        m = re.fullmatch(r"/api/jobs/([0-9a-f]{12})(/context|/routes/(\d{1,2})\.gpx)?", path)
-        if m:
-            job = self.app.job(m.group(1))
-            if not m.group(2):
-                return self._json(job.status_json())
-            if job.status != "done":
-                raise ApiError(409, "That route search hasn't finished.")
-            if m.group(2) == "/context":
-                return self._send(200, context_json(job), "application/json")
-            filename, body = gpx_download(job, int(m.group(3)))
-            return self._send(200, body, "application/gpx+xml",
-                              {"Content-Disposition": f'attachment; filename="{filename}"'})
+            return self._json(geocode_json(app, parse_qs(url.query)))
+        if path == "/api/estimate":
+            return self._json(estimate_json(app, parse_qs(url.query)))
+        if path == "/api/saved":
+            return self._json({"routes": app.saved.list()})
+        if m := re.fullmatch(JOB, path):
+            return self._json(app.job(m.group(1)).status_json())
+        if m := re.fullmatch(JOB + "/context", path):
+            return self._send(200, context_json(app.finished_job(m.group(1))), "application/json")
+        if m := re.fullmatch(JOB + r"/routes/(\d{1,2})\.gpx", path):
+            filename, xml = gpx_text(app.finished_job(m.group(1)), int(m.group(2)), app.elevation)
+            return self._download(filename, xml)
+        if m := re.fullmatch(SAVED, path):
+            return self._json(app.saved.get(m.group(1)))
+        if m := re.fullmatch(SAVED + r"\.gpx", path):
+            return self._download(saved.file_name(app.saved.get(m.group(1))["name"]), app.saved.gpx(m.group(1)))
         if path.startswith("/api/"):
             raise ApiError(404, "Not found.")
         return self._static(path)
 
     def _post(self, url):
-        if url.path != "/api/plan":
+        app, path = self.app, url.path
+        if path == "/api/plan":
+            job = app.submit(parse_route_request(self._read_json()))
+            return self._json({"job": job.id}, 202)
+        if m := re.fullmatch(JOB + "/cancel", path):
+            return self._json(app.cancel(m.group(1)))
+        if m := re.fullmatch(JOB + r"/routes/(\d{1,2})/reverse", path):
+            return self._json(reverse_route(app.finished_job(m.group(1)), int(m.group(2)), app.elevation))
+        if path == "/api/saved":
+            return self._json(save_route(app, self._read_json()), 201)
+        raise ApiError(404, "Not found.")
+
+    def _patch(self, url):
+        m = re.fullmatch(SAVED, url.path)
+        if not m:
             raise ApiError(404, "Not found.")
-        job = self.app.submit(parse_route_request(self._read_json()))
-        self._json({"job": job.id}, 202)
+        body = self._read_json()
+        done = body.get("done")
+        if done is not None and not isinstance(done, bool):
+            raise ApiError(400, "done should be true or false.")
+        return self._json(self.app.saved.update(m.group(1), name=body.get("name"), done=done))
+
+    def _delete(self, url):
+        m = re.fullmatch(SAVED, url.path)
+        if not m:
+            raise ApiError(404, "Not found.")
+        self.app.saved.delete(m.group(1))
+        return self._json({"deleted": m.group(1)})
 
     # -- safety: answer only pages served from this computer --------------------------
 
@@ -437,6 +632,10 @@ class Handler(BaseHTTPRequestHandler):
             body = fh.read()
         headers = {"Content-Security-Policy": CSP} if ctype.startswith("text/html") else {}
         self._send(200, body, ctype, headers, cache="no-cache")
+
+    def _download(self, filename: str, text: str):
+        self._send(200, text.encode(), "application/gpx+xml",
+                   {"Content-Disposition": f'attachment; filename="{filename}"'})
 
     def _json(self, obj, status=200):
         body = json.dumps(obj, separators=(",", ":"), default=_json_default).encode()

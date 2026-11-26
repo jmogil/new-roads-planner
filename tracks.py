@@ -141,8 +141,10 @@ def load_tracks(export_dir: str, cache_dir: str, workers: int | None = None) -> 
                 )
                 if i % 200 == 0:
                     print(f"  {i}/{len(todo)}")
-        with open(cache_path, "wb") as fh:
+        # write-then-rename: the command line and the web app may both be reading this cache
+        with open(cache_path + ".part", "wb") as fh:
             pickle.dump(cached, fh)
+        os.replace(cache_path + ".part", cache_path)
 
     return [t for t in cached.values() if len(t.latlon) > 1]
 

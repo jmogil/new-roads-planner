@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+import progress
 import roads
 import tracks as tracks_mod
 from planner import Plan, PlanOptions, Planner
@@ -27,6 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CACHE = os.path.join(HERE, "cache")
 MODES = ("ride", "run")
 MAX_SNAP_M = 1000.0  # a start or finish further than this from a usable road is probably a mis-click
+BUILD_SECONDS_PER_TILE = 3.0  # merging, building the graph and matching coverage after a download
 
 
 class PlannerError(Exception):
@@ -205,21 +207,32 @@ class Workspace:
                 self._usual[mode] = common_start(self.tracks_for(mode))
             return self._usual[mode]
 
-    def graph_for(self, mode: str, start, end, distance_m: float, tolerance: float) -> roads.RoadGraph:
-        """The road graph covering every route of this length, downloaded first if need be."""
+    def _area_for(self, mode: str, start, end, distance_m: float, tolerance: float):
+        """Which road graph a route needs.
+
+        Returns (cached graph file or None, centre, radius needed, (lat, lon, radius) to download).
+        Every route of this length fits in a circle of `need` around the centre: the start for a
+        loop, the midpoint for A -> B.
+        """
         center = start if end is None else ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
         need = distance_m * (1 + tolerance) / 2 + 1500
         path = roads.find_cached_graph(self.cache_dir, mode, center[0], center[1], need)
+        # a new download is centred on a rounded point, with a rounded-up radius, so nearby
+        # routes later can reuse it
+        download = (round(center[0], 2), round(center[1], 2), math.ceil((need + 1500) / 5000.0) * 5000.0)
+        return path, center, need, download
+
+    def graph_for(self, mode: str, start, end, distance_m: float, tolerance: float) -> roads.RoadGraph:
+        """The road graph covering every route of this length, downloaded first if need be."""
+        path, center, need, (c_lat, c_lon, radius) = self._area_for(mode, start, end, distance_m, tolerance)
         with self._lock:
             if path in self._graphs:
                 self._graphs.move_to_end(path)
                 return self._graphs[path]
+        progress.report("network")
         if path:
             rg = roads.load_graph(self.cache_dir, mode, center[0], center[1], need)
         else:
-            # round so nearby future requests reuse the same downloaded graph
-            c_lat, c_lon = round(center[0], 2), round(center[1], 2)
-            radius = math.ceil((need + 1500) / 5000.0) * 5000.0
             rg = roads.load_graph(self.cache_dir, mode, c_lat, c_lon, radius)
             path = (roads.find_cached_graph(self.cache_dir, mode, c_lat, c_lon, radius)
                     or f"{mode}:{c_lat}:{c_lon}:{radius}")
@@ -228,6 +241,21 @@ class Workspace:
             while len(self._graphs) > self.keep_graphs:
                 self._graphs.popitem(last=False)
         return rg
+
+    def estimate(self, mode: str, start, end, distance_km: float, tolerance: float = 0.05) -> dict:
+        """Can a route here be planned straight away, or does road data need downloading first?
+
+        {"ready": True}, or {"ready": False, "tiles": parts in all, "tiles_left": parts still to
+        download, "minutes": a rough time for the download and the one-off processing after it}.
+        """
+        path, _, _, (c_lat, c_lon, radius) = self._area_for(mode, start, end, distance_km * 1000, tolerance)
+        if path:
+            return {"ready": True}
+        total = roads.tiles_per_side(radius) ** 2
+        osm = roads.osm_file(self.cache_dir, mode, c_lat, c_lon, radius)
+        left = 0 if os.path.exists(osm) else sum(not os.path.exists(f"{osm}.tile{i}") for i in range(1, total + 1))
+        seconds = left * roads.typical_tile_seconds(self.cache_dir) + total * BUILD_SECONDS_PER_TILE
+        return {"ready": False, "tiles": total, "tiles_left": left, "minutes": max(1, round(seconds / 60))}
 
     def plan(self, req: RouteRequest) -> RouteResult:
         req.validate()
@@ -258,7 +286,9 @@ class Workspace:
         rg = self.graph_for(req.mode, start, end, D, req.tolerance)
         print(f"Road network: {rg.n_nodes:,} junctions, {len(rg.edge_len):,} road segments, "
               f"{rg.edge_len.sum() / 1000:,.0f} km")
+        progress.check()
         frac = roads.compute_coverage(rg, used, self.cache_dir)
+        progress.check()
         area = area_stats(rg, frac, start, end, D)
         where = f"Within {D / 2000:.0f} km of start" if end is None else "Within reach of start and finish"
         print(f"{where}: {area['traveled_km']:,.0f} of {area['total_km']:,.0f} km traveled "
@@ -271,6 +301,7 @@ class Workspace:
         s_node = self._snap(planner, rg, start, "start", req.mode)
         e_node = self._snap(planner, rg, end, "finish", req.mode) if end else None
         print("Searching for the route with the most new road...")
+        progress.report("search")
         plans = planner.plan(s_node, e_node, alternatives=req.alternatives)
         if not plans:
             if e_node is not None and e_node != s_node:
