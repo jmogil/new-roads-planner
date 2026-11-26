@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np  # noqa: E402
 
+import bikenet  # noqa: E402
 from planner import OneWay, Plan, PlanOptions, Planner, reverse_loop  # noqa: E402
 from synthetic import grid_graph, node, random_traveled  # noqa: E402
 
@@ -102,6 +103,38 @@ class ReverseLoopTests(unittest.TestCase):
         rg.arc_from, rg.arc_to, rg.arc_edge = rg.edge_u.copy(), rg.edge_v.copy(), np.arange(3, dtype=np.int32)
         with self.assertRaises(OneWay):
             reverse_loop(rg, Plan(nodes=[0, 1, 2, 0], edges=[0, 1, 2], length_m=3000.0, new_m=0.0), np.zeros(3))
+
+class BikeEmphasisTests(unittest.TestCase):
+    def setUp(self):
+        self.rg = grid_graph(N)
+        self.frac = random_traveled(self.rg)
+        # the east-west streets of rows 10 to 14 are on a primary cycle route
+        rg = self.rg
+        east_west = rg.edge_v == rg.edge_u + 1
+        row = rg.edge_u // N
+        self.cls = np.where(east_west & (row >= 10) & (row <= 14), bikenet.PRIMARY, bikenet.NONE).astype(np.int8)
+
+    def route(self, emphasis, bike_class="default"):
+        opts = PlanOptions(distance_m=6000, seed=7, restarts=3, iterations=10, bike_network=emphasis)
+        cls = self.cls if bike_class == "default" else bike_class
+        return Planner(self.rg, self.frac, opts, bike_class=cls).plan(node(N, 7, 12))[0]
+
+    def share_on_network(self, plan):
+        edges = np.asarray(plan.edges)
+        return float(self.rg.edge_len[edges][self.cls[edges] > 0].sum() / plan.length_m)
+
+    def test_emphasis_puts_more_of_the_route_on_the_network(self):
+        off, some, strong = (self.route(e) for e in (0.0, 0.5, 1.0))
+        self.assertLess(self.share_on_network(off), self.share_on_network(some))
+        self.assertLessEqual(self.share_on_network(some), self.share_on_network(strong))
+        self.assertGreater(strong.score, strong.new_m)  # new road on the network counted for more
+        self.assertLessEqual(strong.length_m, 6000 * 1.05)
+
+    def test_without_emphasis_nothing_changes(self):
+        plain, with_classes = self.route(0.0, bike_class=None), self.route(0.0)
+        self.assertEqual(plain.edges, with_classes.edges)
+        self.assertEqual(plain.score, plain.new_m)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
+import bikenet
 import progress
 from roads import Projector, RoadGraph
 
@@ -36,6 +37,7 @@ class PlanOptions:
     restarts: int = 8              # independent searches
     iterations: int = 40           # ruin & recreate steps per search
     seed: int | None = None
+    bike_network: float = 0.0      # 0..1: how strongly to favour a local cycle network (needs bike_class)
 
 
 @dataclass
@@ -45,16 +47,25 @@ class Plan:
     length_m: float
     new_m: float
     waypoints: list[int] = field(default_factory=list)
+    score: float = 0.0               # what the search maximised: new metres, weighted towards the
+                                     # cycle network when that's favoured (equal to new_m otherwise)
 
 
 class Planner:
-    def __init__(self, rg: RoadGraph, traveled_frac: np.ndarray, opts: PlanOptions):
+    def __init__(self, rg: RoadGraph, traveled_frac: np.ndarray, opts: PlanOptions,
+                 bike_class: np.ndarray | None = None):
         self.rg, self.opts = rg, opts
         self.rng = np.random.default_rng(opts.seed)
         new_frac = (1.0 - traveled_frac) * rg.edge_target
         self.new_len = rg.edge_len * new_frac
         pen = 1.0 + (rg.edge_pen - 1.0) * opts.avoid_main_roads
         self.edge_cost = rg.edge_len * pen * (1.0 - opts.eagerness * new_frac)
+        # the search maximises `value`: new metres, unless a cycle network is favoured, in which case
+        # roads on it are cheaper to ride along and new road on it is worth more
+        self.value = self.new_len
+        if bike_class is not None and opts.bike_network > 0:
+            self.edge_cost = self.edge_cost * bikenet.cost_factors(bike_class, opts.bike_network)
+            self.value = self.new_len * bikenet.value_factors(bike_class, opts.bike_network)
         self.edge_cost = np.maximum(self.edge_cost, 0.5)
         a_cost = self.edge_cost[rg.arc_edge]
         self.arc_lookup = {}
@@ -89,7 +100,7 @@ class Planner:
         mid = (self.node_xy[eu] + self.node_xy[ev]) / 2.0
         # ellipse reach test (start/end foci) – a loop is the special case start == end
         ok = (np.hypot(*(mid - s_xy).T) + np.hypot(*(mid - e_xy).T)) <= 2 * reach * 0.9
-        eu, ev, mid, gain = eu[ok], ev[ok], mid[ok], self.new_len[has_new][ok]
+        eu, ev, mid, gain = eu[ok], ev[ok], mid[ok], self.value[has_new][ok]
         if len(gain) == 0:
             return []
         cells = np.floor(mid / cell).astype(np.int64)
@@ -160,7 +171,7 @@ class Planner:
             p = self._splice_loops(self._materialise(tour), budget)
             if p.edges:
                 found.append(p)
-        found.sort(key=lambda p: (-round(p.new_m), p.length_m))
+        found.sort(key=lambda p: (-round(p.score), p.length_m))
         chosen: list[Plan] = []
         for p in found:
             s = set(p.edges)
@@ -170,7 +181,7 @@ class Planner:
                 break
         return chosen
 
-    # leg = (edge ids, node list, length, standalone new metres)
+    # leg = (edge ids, node list, length, standalone value of its new road)
     def _leg(self, a: int, b: int):
         key = (a, b)
         if key in self._legs:
@@ -191,7 +202,7 @@ class Planner:
             edges = np.fromiter((self.arc_lookup[(nodes[i], nodes[i + 1])] for i in range(len(nodes) - 1)),
                                 dtype=np.int32, count=len(nodes) - 1)
             length = float(self.rg.edge_len[edges].sum())
-            gain = float(self.new_len[np.unique(edges)].sum())
+            gain = float(self.value[np.unique(edges)].sum())
             leg = (edges, nodes, length, gain)
         self._legs[key] = leg
         return leg
@@ -200,7 +211,7 @@ class Planner:
         edges = [self._leg(a, b)[0] for a, b in zip(tour[:-1], tour[1:])]
         e = np.unique(np.concatenate(edges)) if edges else np.zeros(0, dtype=np.int32)
         length = sum(self._leg(a, b)[2] for a, b in zip(tour[:-1], tour[1:]))
-        return float(self.new_len[e].sum()), length
+        return float(self.value[e].sum()), length
 
     def _improve(self, tour, start, end, pool, budget, iters):
         """Ruin & recreate: drop some waypoints (random or a contiguous run), refill greedily."""
@@ -267,10 +278,10 @@ class Planner:
                 a, b = tour[pos], tour[pos + 1]
                 ab, ac, cb = self._leg(a, b), self._leg(a, c), self._leg(c, b)
                 # removing leg a->b loses roads that only it covered
-                lost = self.new_len[ab[0][cnt[ab[0]] == 1]].sum()
+                lost = self.value[ab[0][cnt[ab[0]] == 1]].sum()
                 added_edges = np.unique(np.concatenate([ac[0], cb[0]]))
                 after = cnt[added_edges] - np.isin(added_edges, ab[0])
-                added = self.new_len[added_edges[after == 0]].sum()
+                added = self.value[added_edges[after == 0]].sum()
                 dg = added - lost
                 if dg > 0:
                     scored.append((dg / max(dl, 50.0), pos, c, ab, ac, cb, dl))
@@ -297,7 +308,8 @@ class Planner:
         return Plan(nodes=nodes, edges=edges,
                     length_m=float(self.rg.edge_len[e].sum()) if len(e) else 0.0,
                     new_m=float(self.new_len[np.unique(e)].sum()) if len(e) else 0.0,
-                    waypoints=list(tour[1:-1]))
+                    waypoints=list(tour[1:-1]),
+                    score=float(self.value[np.unique(e)].sum()) if len(e) else 0.0)
 
     def _splice_loops(self, p: Plan, budget: float) -> Plan:
         """Add untraveled self-loop roads (e.g. cul-de-sac circuits) at nodes on the route."""
@@ -310,7 +322,7 @@ class Planner:
             by_node.setdefault(int(rg.edge_u[e]), []).append(int(e))
         used = set(p.edges)
         nodes, edges = [p.nodes[0]], []
-        length, new = p.length_m, p.new_m
+        length, new, score = p.length_m, p.new_m, p.score
         for i, e in enumerate(p.edges):
             n = p.nodes[i]
             for le in by_node.get(n, []):
@@ -320,9 +332,10 @@ class Planner:
                     used.add(le)
                     length += rg.edge_len[le]
                     new += self.new_len[le]
+                    score += self.value[le]
             nodes.append(p.nodes[i + 1])
             edges.append(e)
-        return Plan(nodes=nodes, edges=edges, length_m=length, new_m=new, waypoints=p.waypoints)
+        return Plan(nodes=nodes, edges=edges, length_m=length, new_m=new, waypoints=p.waypoints, score=score)
 
 
 # -- turning a loop around ------------------------------------------------------------

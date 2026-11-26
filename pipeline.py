@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+import bikenet
 import progress
 import roads
 import tracks as tracks_mod
@@ -127,6 +128,8 @@ class RouteRequest:
     iterations: int = 40
     seed: int | None = None                    # set for reproducible results
     count_all_activities: bool = False         # roads from any activity type count as traveled
+    bike_network: float = 0.0                  # rides, 0..1: how strongly to favour the local cycle
+                                               # network where one is known (bikenet.SOURCES)
 
     def validate(self) -> None:
         if self.mode not in MODES:
@@ -138,7 +141,8 @@ class RouteRequest:
                 raise PlannerError(f"The {label} isn't a valid latitude/longitude.")
         limits = [("alternatives", self.alternatives, 1, 5), ("tolerance", self.tolerance, 0, 0.5),
                   ("eagerness", self.eagerness, 0, 0.95), ("avoid_main_roads", self.avoid_main_roads, 0, 3),
-                  ("restarts", self.restarts, 1, 64), ("iterations", self.iterations, 1, 500)]
+                  ("restarts", self.restarts, 1, 64), ("iterations", self.iterations, 1, 500),
+                  ("bike_network", self.bike_network, 0, 1)]
         for name, value, lo, hi in limits:
             if not lo <= value <= hi:
                 raise PlannerError(f"{name} must be between {lo} and {hi}.")
@@ -155,6 +159,15 @@ class RouteResult:
     plans: list[Plan]                 # best first
     activities_used: int
     area: dict                        # how much of the road network within reach is already traveled
+    bike_class: np.ndarray | None = None        # each road's cycle network class, where one is known
+    bike_source: bikenet.Source | None = None   # ...and whose network that is
+
+    def bike_m(self, plan: Plan) -> float | None:
+        """Metres of a route on the cycle network (None where there's no network data)."""
+        if self.bike_class is None or not plan.edges:
+            return None
+        edges = np.asarray(plan.edges)
+        return float(self.graph.edge_len[edges][self.bike_class[edges] > 0].sum())
 
 
 def area_stats(rg: roads.RoadGraph, frac: np.ndarray, start, end, distance_m: float) -> dict:
@@ -189,6 +202,7 @@ class Workspace:
         self._tracks = None
         self._usual: dict[str, tuple[float, float] | None] = {}
         self._graphs: OrderedDict[str, roads.RoadGraph] = OrderedDict()
+        self._bike_networks: dict[str, bikenet.Network] = {}
 
     def all_tracks(self) -> list:
         with self._lock:
@@ -294,10 +308,17 @@ class Workspace:
         print(f"{where}: {area['traveled_km']:,.0f} of {area['total_km']:,.0f} km traveled "
               f"({area['traveled_pct']:.1f}%)")
 
+        bike_class, bike_source = self.bike_classes(rg, start, end) if req.mode == "ride" else (None, None)
+        emphasis = req.bike_network if bike_class is not None else 0.0
+        if req.bike_network > 0 and bike_class is None:
+            print("No cycle network data covers this route, so it can't be favoured here.")
+        elif emphasis > 0:
+            print(f"Favouring the {bike_source.name} (strength {emphasis:.2f}).")
+
         opts = PlanOptions(distance_m=D, tolerance=req.tolerance, eagerness=req.eagerness,
                            avoid_main_roads=req.avoid_main_roads, restarts=req.restarts,
-                           iterations=req.iterations, seed=req.seed)
-        planner = Planner(rg, frac, opts)
+                           iterations=req.iterations, seed=req.seed, bike_network=emphasis)
+        planner = Planner(rg, frac, opts, bike_class=bike_class)
         s_node = self._snap(planner, rg, start, "start", req.mode)
         e_node = self._snap(planner, rg, end, "finish", req.mode) if end else None
         print("Searching for the route with the most new road...")
@@ -314,7 +335,27 @@ class Workspace:
                     f"{math.ceil(planner.direct_m * 1.2 / 1000)} km or more.")
             raise PlannerError("No route found - try a larger distance or another start point.")
         return RouteResult(request=req, options=opts, start=start, end=end, graph=rg,
-                           new_len=planner.new_len, plans=plans, activities_used=len(used), area=area)
+                           new_len=planner.new_len, plans=plans, activities_used=len(used), area=area,
+                           bike_class=bike_class, bike_source=bike_source)
+
+    def bike_network(self, source: bikenet.Source) -> bikenet.Network:
+        """A source's cycle network, downloaded on first use. Raises bikenet.Unavailable."""
+        with self._lock:
+            if source.id not in self._bike_networks:
+                self._bike_networks[source.id] = bikenet.load(self.cache_dir, source)
+            return self._bike_networks[source.id]
+
+    def bike_classes(self, rg: roads.RoadGraph, start, end=None):
+        """(each road's cycle network class, the network's source), or (None, None) where no
+        known network covers the start or finish, or its data can't be had."""
+        source = bikenet.source_for(*start) or (bikenet.source_for(*end) if end else None)
+        if source is None:
+            return None, None
+        try:
+            return bikenet.edge_classes(rg, self.bike_network(source), self.cache_dir), source
+        except bikenet.Unavailable as exc:
+            print(f"The {source.name} isn't available ({exc}), so routes won't use it.")
+            return None, None
 
     @staticmethod
     def _snap(planner: Planner, rg: roads.RoadGraph, point, label: str, mode: str) -> int:
