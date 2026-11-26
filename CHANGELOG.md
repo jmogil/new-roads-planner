@@ -2,6 +2,33 @@
 
 All notable changes to this project.
 
+## 0.4.0, 2026-11-26
+
+### Added
+
+- **Brisbane's bike network.** Rides can favour Brisbane City Council's bicycle network: the City
+  Plan 2014 bicycle network overlay's primary, secondary and local cycle routes and the RiverWalk,
+  CC BY 4.0.
+  - A **Bike network** switch and strength dial appear for rides starting or finishing in
+    Brisbane City. They're on by default at "balanced".
+  - Favouring the network makes its roads cheaper to route along and its new road worth more.
+    On a test loop, *balanced* took the share of the route on the network from about 40% to two
+    thirds while giving up very little new road. Full strength took it past 80%.
+  - Each suggestion says how far it runs on the network.
+  - `--bike-network 0..1` does the same on the command line.
+- **Bike network overlay**: a map button that shows the whole network by route class, with the
+  council's attribution.
+- `bikenet.py`: council cycle networks, downloaded once (refreshed every 90 days) and matched
+  onto the road graph. A road is on a route when the route runs within 15 m in the same
+  direction along at least half of it. Sources are listed in a table, so other cities can be
+  added.
+
+### Changed
+
+- The search now maximises a route's *value*: new metres, weighted towards the bike network when
+  it's favoured. With it off the value is exactly the new metres, so routes are unchanged (the
+  same seed gives the same routes).
+
 ## 0.3.0, 2026-11-25
 
 ### Added (web app)

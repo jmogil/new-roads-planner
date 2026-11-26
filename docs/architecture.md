@@ -19,6 +19,7 @@ flowchart LR
     PN["planner.py"]
     EL["elevation.py"]
     SV["saved.py"]
+    BN["bikenet.py"]
     EX["export.py"]
     PG["progress.py"]
     EXP[("Strava export<br/>FIT / GPX / TCX")]
@@ -30,6 +31,7 @@ flowchart LR
   PL --> TR
   PL --> RD
   PL --> PN
+  PL --> BN
   WA --> EL
   WA --> SV
   WA --> EX
@@ -41,6 +43,8 @@ flowchart LR
   RD --> CA
   EL --> CA
   SV --> CA
+  BN --> CA
+  BN -- "council cycle network" --> BCC["Brisbane City Council open data"]
   RD -- "road data" --> OV["Overpass API"]
   RD -- "place search" --> NO["Nominatim"]
   EL -- "1° elevation squares" --> TT["AWS Terrain Tiles"]
@@ -62,6 +66,7 @@ and saved routes are web-app features, so far.
 | `progress.py` | Progress reports and cancellation for the slow steps. Outside the web app it does nothing. |
 | `elevation.py` | Ground heights from SRTM: downloads and caches 1° squares, interpolates heights, and builds route profiles with total ascent and descent. |
 | `saved.py` | Saved routes on disk, in `cache/saved_routes/`. |
+| `bikenet.py` | Local cycle networks published by councils, so far Brisbane's. Downloads and caches them, matches them onto the road graph (a class per road), and turns the "favour the network" strength into routing-cost and value multipliers. |
 | `export.py` | Output: GPX (with elevation when it's available), the command line's Folium HTML map and JSON summary, and the route segments and nearby roads that the web app draws. |
 | `newroutes.py` | The command line. |
 | `webapp.py` | The web app's server: static files, a JSON API, and a single background worker that runs searches. |
@@ -89,8 +94,19 @@ and saved routes are web-app features, so far.
    once. It then builds and improves tours. For A → B, the direct start → finish leg is
    budgeted from the start. If even that leg doesn't fit, `plan()` returns nothing and records
    `direct_m`, so the pipeline can say what distance would work.
-6. **Result.** A `RouteResult` holds the plans (node and edge sequences), the graph and the
-   untraveled length per road. The web app then adds an elevation profile to each route, and
+6. **Bike network (rides).** If a known council cycle network covers the start or finish,
+   `Workspace.bike_classes()` gives each road a class: none, primary, secondary, local or
+   RiverWalk. It downloads the network on first use and caches the match per graph.
+   - The planner's `bike_network` strength (0–1) multiplies the routing cost of network roads by
+     `1 − strength × discount`. The discount is 0.6 for primary routes and the RiverWalk, 0.5 for
+     secondary and 0.35 for local.
+   - It also multiplies the *value* of new road on them by `1 + strength × bonus`: 1.0, 0.75 and
+     0.4 respectively.
+   - The search maximises that value. `Plan.score` records it, and `Plan.new_m` stays the real new
+     metres.
+   - At strength 0 nothing changes: the same seed gives the same routes.
+7. **Result.** A `RouteResult` holds the plans (node and edge sequences), the graph, the
+   untraveled length per road and the bike network classes. The web app then adds an elevation profile to each route, and
    each front end turns the result into files or JSON.
 
 ## Shared caches and concurrency
@@ -105,6 +121,8 @@ Everything lives in `cache/`, which is git-ignored because it describes where yo
 | `coverage_<hash>.npy` | Traveled fraction per road | Automatic: the hash covers the graph and the activity IDs |
 | `elevation/<square>.npy` | SRTM heights for a 1° square (3601 × 3601), memory-mapped when read | Never |
 | `saved_routes/<id>.json`, `.gpx` | Saved routes | Deleted from the web app |
+| `bikenet/<source>.geojson` | A council's cycle network, as published | Downloaded again after 90 days; the old copy is kept if that fails |
+| `bikenet/classes_<hash>.npy` | Each road's cycle network class, for one graph | Automatic: the hash covers the graph, the network data and the matching settings |
 | `locks/<area>.lock` | Per-area download locks (empty files) | Never; they're tiny |
 | `download_stats.json` | How long recent tiles took to download, for estimates | Keeps the latest 50 |
 | `settings.json` | The export path used last | Overwritten by the next `--export` |
@@ -171,12 +189,15 @@ or 5xx status.
 
 ```json
 {
-  "version": "0.3.0",
+  "version": "0.4.0",
   "export": "/path/to/export_12345678",
   "export_problem": null,
   "activities": {"ride": 1200, "run": 450},
   "usual_start": {"ride": {"lat": 51.5007, "lon": -0.1246}, "run": {"lat": 51.5007, "lon": -0.1246}},
   "areas": [{"mode": "ride", "lat": 51.5, "lon": -0.12, "radius_m": 20000.0}],
+  "bike_networks": [{"id": "brisbane", "name": "Brisbane City Council bicycle network",
+                     "short": "Brisbane's bike network", "bbox": [152.79, -27.67, 153.21, -27.27],
+                     "attribution": "Bicycle network: Brisbane City Council, City Plan 2014 (CC BY 4.0)"}],
   "active_job": null
 }
 ```
@@ -198,11 +219,13 @@ downloading first.
   "avoid_main_roads": 1,
   "eagerness": 0.6,
   "effort": "normal",
-  "count_all_activities": false
+  "count_all_activities": false,
+  "bike_network": 0.5
 }
 ```
 
-`end` set to a point makes an A → B route. `effort` is `quick`, `normal` or `thorough`, which
+`end` set to a point makes an A → B route. `bike_network` (0–1, rides only) is how strongly to
+favour a council cycle network. It's ignored where none covers the route. `effort` is `quick`, `normal` or `thorough`, which
 means 4×20, 8×40 or 16×80 restarts × iterations. The response is `202 {"job": "3a356452eabb"}`,
 or `400` for invalid input.
 
@@ -257,6 +280,11 @@ or `400` for invalid input.
   previous one ended. Coordinates are `[lat, lon]`, rounded to 5 decimals (about 1 m).
 - `profile` samples the route every 20–25 m and is `null` when elevation couldn't be
   downloaded.
+- For rides where a council cycle network covers the route:
+  - Each route also has `bike_km` and `bike_pct`, the distance on the network.
+  - The result has `bike_network`: the network's details plus the `emphasis` actually used.
+
+  Both are `null` elsewhere.
 
 **`POST /api/jobs/{id}/cancel`**: cancel a search. Returns its status.
 
@@ -286,6 +314,12 @@ sidewalks and crossings. It can be a few MB, so the page fetches it after drawin
 
 A missing saved route is `404`.
 
+**`GET /api/bike-network/{id}`**: a council cycle network for the map overlay:
+`{"id", "name", "short", "bbox", "attribution", "classes": {"primary": [lines], "secondary": [...],
+"local": [...], "riverwalk": [...]}}`, with each line as `[[lat, lon], ...]`. It downloads on first
+use and is about 1.8 MB for Brisbane. Returns `404` for an unknown network, and `502` if it can't be
+downloaded.
+
 **`GET /api/geocode?q=...&viewbox=west,north,east,south`**: place search through Nominatim,
 which allows at most one request per second. The `viewbox` prefers matches in view without
 excluding others. Returns `{"results": [{"name": "...", "lat": 0, "lon": 0}]}`.
@@ -310,6 +344,19 @@ The server can read your activity history and start downloads, so it only answer
   to the server, and the page can't be framed.
 - The page puts place names, route names and other text into the page as text, never as HTML.
 
+## Adding another city's cycle network
+
+Add a `Source` to `bikenet.SOURCES` with:
+- the area it covers (`bbox`)
+- a GeoJSON download URL
+- the feature property that holds each line's category
+- how those categories map onto primary, secondary, local and RiverWalk
+- the attribution its licence requires
+
+The planner, the web app's controls and the map overlay pick it up from there. A network that
+publishes as an ArcGIS feature service can use its `query?where=1=1&outFields=*&f=geojson`
+endpoint. Property names are matched whatever their case.
+
 ## Testing
 
 ```bash
@@ -325,6 +372,13 @@ The server can read your activity history and start downloads, so it only answer
   download-time estimates.
 - `tests/test_elevation.py` covers interpolation from a tiny hand-made tile, tile naming, the
   climbing total and route profiles over a synthetic hill.
+- `tests/test_bikenet.py` covers:
+  - reading council GeoJSON
+  - matching on the synthetic grid, including the direction check that keeps crossing streets out
+  - the per-graph cache
+  - keeping the old copy when a refresh fails
+- The planner tests check that turning up the bike-network strength puts more of a route on the
+  network, and that it changes nothing at 0.
 - `tests/test_webapp.py` starts the real HTTP server on a spare port, with a workspace whose road
   network is a synthetic grid (rides get alternating one-way streets) and that has no Strava
   data. It runs searches through the API and checks:
@@ -333,6 +387,7 @@ The server can read your activity history and start downloads, so it only answer
   - estimates
   - reversing, including detours round one-way streets
   - saved routes from end to end
+  - favouring a stand-in local bike network, and its map overlay
   - input validation, the Host and Origin checks, and static file serving
 
 None of them needs network access or personal data, so they're safe to run anywhere.
