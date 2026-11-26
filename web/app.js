@@ -5,7 +5,10 @@ const MODES = {
   ride: { distance: 40, min: 5, max: 200, step: 1, plural: "rides", kmMarks: [5, 10, 20, 50, 100] },
   run: { distance: 10, min: 2, max: 60, step: 0.5, plural: "runs", kmMarks: [1, 2, 5, 10, 20] },
 };
-const DEFAULT_OPTIONS = { alternatives: 3, avoidMain: 1, eagerness: 0.6, effort: "normal", countAll: false };
+const DEFAULT_OPTIONS = {
+  alternatives: 3, avoidMain: 1, eagerness: 0.6, effort: "normal", countAll: false,
+  bikeOn: true, bikeStrength: 0.5, // favour a local bike network where one is known (rides only)
+};
 const STORE_KEY = "new-roads-planner:v1";
 const POLL_MS = 1000;
 const STAGES = { // what the planner is doing, from its progress reports
@@ -14,6 +17,7 @@ const STAGES = { // what the planner is doing, from its progress reports
   build: "Building the road network (a one-off for this area)…",
   coverage: "Working out which roads you've done…",
   search: "Searching for the route with the most new road…",
+  bikenet: "Getting the bike network ready (a one-off for this area)…",
   elevation: "Adding elevation (a one-off download for this area)…",
 };
 
@@ -33,7 +37,7 @@ const state = {
   start: null,                  // { lat, lon, label, source: "usual" | "search" | "map" | "gps" }
   end: null,
   options: { ...DEFAULT_OPTIONS },
-  show: { untraveled: true, traveled: false, areas: true, key: true, aerial: false },
+  show: { untraveled: true, traveled: false, areas: true, key: true, aerial: false, bikenet: false },
   config: null,                 // from /api/config
   pick: null,                   // "start" | "end" while the next map click sets it
   job: null,                    // id of the search in progress
@@ -112,6 +116,8 @@ function restore() {
   if (o.eagerness >= 0 && o.eagerness <= 0.95) state.options.eagerness = o.eagerness;
   if (["quick", "normal", "thorough"].includes(o.effort)) state.options.effort = o.effort;
   state.options.countAll = o.countAll === true;
+  if (typeof o.bikeOn === "boolean") state.options.bikeOn = o.bikeOn;
+  if (o.bikeStrength >= 0.1 && o.bikeStrength <= 1) state.options.bikeStrength = o.bikeStrength;
   for (const k in state.show) if (typeof (s.show || {})[k] === "boolean") state.show[k] = s.show[k];
   if (typeof s.lastJob === "string" && /^[0-9a-f]{12}$/.test(s.lastJob)) state.lastJob = s.lastJob;
 }
@@ -161,11 +167,15 @@ const bases = {
 };
 
 // draw order: downloaded areas < nearby roads < other suggestions < chosen route < arrows < pins
-for (const [pane, z] of [["areas", 350], ["context", 380], ["alts", 390], ["marks", 450]]) map.createPane(pane).style.zIndex = z;
+for (const [pane, z] of [["areas", 350], ["context", 380], ["bikenet", 385], ["alts", 390], ["marks", 450]]) {
+  map.createPane(pane).style.zIndex = z;
+}
 map.getPane("marks").style.pointerEvents = "none";
 const contextRenderer = L.canvas({ pane: "context", padding: 0.3 }); // thousands of lines: canvas is much faster
+const bikenetRenderer = L.canvas({ pane: "bikenet", padding: 0.3 });
 const layers = {
   areas: L.layerGroup(),
+  bikenet: L.layerGroup(),
   untraveled: L.layerGroup(),
   traveled: L.layerGroup(),
   alts: L.layerGroup().addTo(map),
@@ -189,6 +199,7 @@ function setBase(kind) {
 
 // colours depend on the theme and the base map, so redraw everything that uses them
 function restyle() {
+  drawBikeNetwork();
   renderAreas();
   drawRoutes();
   drawContext();
@@ -453,7 +464,106 @@ function updateHints() {
     hint.textContent = `About ${km(d)} km from start to finish.`;
   }
   scheduleEstimate();
+  updateBikeField();
   updateGenerate();
+}
+
+// ---------- the local bike network ----------
+
+function covers(net, p) {
+  return Boolean(p) && p.lat >= net.bbox[1] && p.lat <= net.bbox[3] && p.lon >= net.bbox[0] && p.lon <= net.bbox[2];
+}
+
+// the bike network a ride from here would use (the planner uses the one covering the start or finish)
+function routeNetwork() {
+  if (state.mode !== "ride" || !state.config) return null;
+  const nets = state.config.bike_networks || [];
+  return nets.find((n) => covers(n, state.start) || (state.routeType === "oneway" && covers(n, state.end))) || null;
+}
+
+function updateBikeField() {
+  const net = routeNetwork();
+  $("#bike-field").hidden = !net;
+  if (!net) return;
+  const on = state.options.bikeOn;
+  $("#bike-on").checked = on;
+  $("#bike-on-label").textContent = `Prefer ${net.short}`;
+  $("#bike-strength-row").classList.toggle("off", !on);
+  $("#bike-strength").disabled = !on;
+  showBikeStrength();
+  $("#bike-hint").textContent = on
+    ? "Routes keep to the council's cycle routes and the RiverWalk where they can, and new road on them counts " +
+      "for more. It's a planning map, so a few routes may be planned rather than built."
+    : "Off: routes go wherever the most new road is, whatever the road.";
+}
+
+function showBikeStrength() {
+  const v = state.options.bikeStrength;
+  $("#bike-strength").value = String(v);
+  $("#bike-strength-value").textContent = `${v < 0.35 ? "a little" : v < 0.75 ? "balanced" : "strongly"} · ${v.toFixed(2)}`;
+}
+
+const bikeData = {}; // network id -> lines by class, fetched once
+let noticeTimer = 0;
+
+function showNotice(message, seconds = 5) {
+  const box = $("#map-notice");
+  box.textContent = message;
+  box.hidden = !message;
+  clearTimeout(noticeTimer);
+  if (message && seconds) noticeTimer = setTimeout(() => { box.hidden = true; }, seconds * 1000);
+}
+
+async function setBikeNetworkShown(on) {
+  state.show.bikenet = on;
+  $("#bikenet-toggle").setAttribute("aria-pressed", String(on));
+  $("#bikenet-legend").hidden = !on;
+  save();
+  const nets = (state.config && state.config.bike_networks) || [];
+  for (const net of nets) map.attributionControl.removeAttribution(net.attribution);
+  if (!on) {
+    layers.bikenet.remove();
+    showNotice("");
+    return;
+  }
+  layers.bikenet.addTo(map);
+  try {
+    for (const net of nets) {
+      if (!bikeData[net.id]) {
+        showNotice(`Loading ${net.short}…`, 0);
+        bikeData[net.id] = await api(`/api/bike-network/${net.id}`);
+      }
+    }
+  } catch (err) {
+    showNotice(err.message, 8);
+    if (state.show.bikenet) setBikeNetworkShown(false);
+    return;
+  }
+  if (!state.show.bikenet) return; // switched off again while loading
+  for (const net of nets) map.attributionControl.addAttribution(net.attribution);
+  drawBikeNetwork();
+  const view = map.getBounds();
+  const inView = nets.filter((n) => view.intersects(L.latLngBounds([[n.bbox[1], n.bbox[0]], [n.bbox[3], n.bbox[2]]])));
+  showNotice(inView.length ? "" : `The bike network overlay covers ${nets.map((n) => n.short.replace(/'s bike network$/, "")).join(", ")}.`);
+  if (inView.length === 1 && nets.length) $("#bikenet-legend-title").textContent = inView[0].name;
+}
+
+function drawBikeNetwork() {
+  layers.bikenet.clearLayers();
+  if (!state.show.bikenet) return;
+  const line = { renderer: bikenetRenderer, interactive: false, lineJoin: "round", lineCap: "round", opacity: 0.9 };
+  const styles = { // drawn in this order, so the more important routes sit on top
+    local: { color: color("--bn-local"), weight: 2, opacity: 0.85, dashArray: "4 4" },
+    secondary: { color: color("--bn-secondary"), weight: 3.2 },
+    primary: { color: color("--bn-primary"), weight: 5 },
+    riverwalk: { color: color("--bn-riverwalk"), weight: 5, dashArray: "9 5" },
+  };
+  for (const data of Object.values(bikeData)) {
+    for (const [cls, style] of Object.entries(styles)) {
+      const lines = data.classes[cls] || [];
+      if (lines.length) L.polyline(lines, { ...line, ...style }).addTo(layers.bikenet);
+    }
+  }
 }
 
 // does this area's road data need downloading first? (asked of webapp.py, which knows the cache)
@@ -542,6 +652,7 @@ async function generate(e) {
     eagerness: o.eagerness,
     effort: o.effort,
     count_all_activities: o.countAll,
+    bike_network: routeNetwork() && o.bikeOn ? o.bikeStrength : 0,
   };
   state.job = "starting";
   updateGenerate();
@@ -808,7 +919,10 @@ function routeCard(r, i) {
   main.addEventListener("click", () => select(i));
 
   const title = el("span", { className: "route-title", textContent: res.saved ? res.saved.name : `Option ${i + 1}` });
-  if (!res.saved && i === 0 && res.routes.length > 1) title.append(el("span", { className: "badge", textContent: "most new road" }));
+  if (!res.saved && i === 0 && res.routes.length > 1) {
+    const favoured = res.bike_network && res.bike_network.emphasis > 0;
+    title.append(el("span", { className: "badge", textContent: favoured ? "best fit" : "most new road" }));
+  }
   if (res.saved && res.saved.done) title.append(el("span", { className: "badge done", textContent: "done" }));
 
   const stats = el("span", { className: "route-stats" });
@@ -819,7 +933,14 @@ function routeCard(r, i) {
   const fill = el("span");
   fill.style.width = `${clamp(r.new_pct, 0, 100)}%`;
   bar.append(fill);
-  main.append(title, stats, bar);
+  main.append(title, stats);
+  if (r.bike_km != null) {
+    const bike = el("span", { className: "route-bike" });
+    bike.innerHTML = icon("bike");
+    bike.append(document.createTextNode(`${km(r.bike_km)} km on the bike network (${r.bike_pct}%)`));
+    main.append(bike);
+  }
+  main.append(bar);
 
   const actions = el("div", { className: "route-actions" });
   actions.append(gpxLink(r.gpx_url));
@@ -1078,6 +1199,7 @@ function savedItem(s, showing) {
     `${km(s.distance_km)} km`,
     `${km(s.new_km)} km new`,
     s.ascent_m != null ? `↑ ${nf0.format(s.ascent_m)} m` : null,
+    s.bike_km != null ? `${km(s.bike_km)} km on the bike network` : null,
     s.saved_at ? dateFormat.format(new Date(s.saved_at)) : null,
   ].filter(Boolean).join(" · ");
 
@@ -1144,6 +1266,7 @@ async function showSaved(id) {
     mode: s.mode, route_type: s.route_type, distance_km: s.distance_km, start: s.start, end: s.end,
     routes: [{
       index: 0, distance_km: s.distance_km, new_km: s.new_km, new_pct: s.new_pct, ascent_m: s.ascent_m,
+      bike_km: s.bike_km, bike_pct: s.bike_pct,
       bounds: s.bounds, segments: s.segments, profile: s.profile, gpx_url: `/api/saved/${id}.gpx`,
     }],
   });
@@ -1245,6 +1368,9 @@ function bindUI() {
   onRadio("effort", (v) => { state.options.effort = v; markStale(); save(); });
   $("#eagerness").addEventListener("input", (e) => { state.options.eagerness = Number(e.target.value); showEagerness(); markStale(); save(); });
   $("#count-all").addEventListener("change", (e) => { state.options.countAll = e.target.checked; markStale(); save(); });
+  $("#bike-on").addEventListener("change", (e) => { state.options.bikeOn = e.target.checked; updateBikeField(); markStale(); save(); });
+  $("#bike-strength").addEventListener("input", (e) => { state.options.bikeStrength = Number(e.target.value); showBikeStrength(); markStale(); save(); });
+  $("#bikenet-toggle").addEventListener("click", () => setBikeNetworkShown(!state.show.bikenet));
   $("#distance-range").addEventListener("input", (e) => setDistance(e.target.value));
   $("#distance").addEventListener("change", (e) => setDistance(e.target.value));
 
@@ -1312,6 +1438,7 @@ async function init() {
   }
   initialView();
   updateHints();
+  if (state.show.bikenet) setBikeNetworkShown(true);
   await loadSaved();
   resume();
 }

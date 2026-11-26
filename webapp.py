@@ -36,6 +36,7 @@ warnings.filterwarnings("ignore", message=".*OpenSSL.*")
 
 import numpy as np  # noqa: E402
 
+import bikenet  # noqa: E402
 import elevation  # noqa: E402
 import export  # noqa: E402
 import pipeline  # noqa: E402
@@ -44,7 +45,7 @@ import roads  # noqa: E402
 import saved  # noqa: E402
 import planner  # noqa: E402
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(HERE, "web")
 KEEP_JOBS = 12          # finished searches kept for GPX downloads (each holds its routes)
@@ -174,6 +175,7 @@ class App:
         self.export_problem = export_problem
         self.elevation = elevation.Elevation(ws.cache_dir)
         self.saved = saved.SavedRoutes(ws.cache_dir)
+        self.bike_display: dict[str, bytes] = {}  # cycle networks ready for the map overlay
         self.jobs: OrderedDict[str, Job] = OrderedDict()
         self.lock = threading.Lock()
         self.queue: queue.Queue[Job] = queue.Queue()
@@ -289,6 +291,7 @@ def parse_route_request(body: dict) -> pipeline.RouteRequest:
         alternatives=number("alternatives", 3, int),
         eagerness=number("eagerness", 0.6),
         avoid_main_roads=number("avoid_main_roads", 1.0),
+        bike_network=number("bike_network", 0.0),
         restarts=restarts, iterations=iterations,
         count_all_activities=bool(body.get("count_all_activities", False)),
     )
@@ -316,12 +319,15 @@ def route_json(job: Job, i: int, elev: elevation.Elevation, download: bool = Tru
     lons = [p[1] for s in segments for p in s["coords"]]
     profile = elevation_profile(segments, elev, download)
     km, new_km = plan.length_m / 1000, plan.new_m / 1000
+    bike_m = res.bike_m(plan)
     return {
         "index": i,
         "distance_km": round(km, 2),
         "new_km": round(new_km, 2),
         "new_pct": round(100 * new_km / km) if km else 0,
         "ascent_m": profile["ascent_m"] if profile else None,
+        "bike_km": None if bike_m is None else round(bike_m / 1000, 2),
+        "bike_pct": None if bike_m is None else (round(100 * bike_m / plan.length_m) if plan.length_m else 0),
         "targets": len(plan.waypoints),
         "bounds": [[min(lats), min(lons)], [max(lats), max(lons)]],
         "segments": segments,
@@ -347,6 +353,8 @@ def summarise(job: Job, elev: elevation.Elevation) -> dict:
         "end": list(res.end) if res.end else None,
         "activities_used": res.activities_used,
         "area": {k: round(v, 1) for k, v in res.area.items()},
+        "bike_network": None if res.bike_source is None else dict(
+            res.bike_source.meta(), emphasis=res.options.bike_network),
         "routes": routes,
         "context_url": f"/api/jobs/{job.id}/context",
     }
@@ -413,11 +421,30 @@ def save_route(app: App, body: dict) -> dict:
         "name": saved.clean_name(body.get("name")) or default,
         "mode": summary["mode"], "route_type": summary["route_type"],
         "distance_km": route["distance_km"], "new_km": route["new_km"], "new_pct": route["new_pct"],
-        "ascent_m": route["ascent_m"], "start": summary["start"], "end": summary["end"],
+        "ascent_m": route["ascent_m"], "bike_km": route.get("bike_km"), "bike_pct": route.get("bike_pct"),
+        "start": summary["start"], "end": summary["end"],
         "bounds": route["bounds"], "segments": route["segments"], "profile": route["profile"],
         "job": job.id, "index": index,
     }
     return app.saved.add(record, gpx)
+
+
+def bike_network_json(app: App, source_id: str) -> bytes:
+    """A cycle network for the map overlay, downloaded on first use."""
+    source = bikenet.get_source(source_id)
+    if source is None:
+        raise ApiError(404, "No such cycle network.")
+    with app.lock:
+        cached = app.bike_display.get(source_id)
+    if cached is None:
+        try:
+            net = app.ws.bike_network(source)
+        except bikenet.Unavailable as exc:
+            raise ApiError(502, f"The {source.name} isn't available right now ({exc}).")
+        cached = json.dumps(net.display(), separators=(",", ":")).encode()
+        with app.lock:
+            app.bike_display[source_id] = cached
+    return cached
 
 
 def config_json(app: App) -> dict:
@@ -433,6 +460,7 @@ def config_json(app: App) -> dict:
         "activities": {mode: len(ws.tracks_for(mode)) for mode in pipeline.MODES},
         "usual_start": usual,
         "areas": [{k: a[k] for k in ("mode", "lat", "lon", "radius_m")} for a in roads.cached_areas(ws.cache_dir)],
+        "bike_networks": [source.meta() for source in bikenet.SOURCES],
         "active_job": app.active_job(),
     }
 
@@ -543,6 +571,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(estimate_json(app, parse_qs(url.query)))
         if path == "/api/saved":
             return self._json({"routes": app.saved.list()})
+        if m := re.fullmatch(r"/api/bike-network/([a-z0-9-]{1,40})", path):
+            return self._send(200, bike_network_json(app, m.group(1)), "application/json", cache="private, max-age=3600")
         if m := re.fullmatch(JOB, path):
             return self._json(app.job(m.group(1)).status_json())
         if m := re.fullmatch(JOB + "/context", path):

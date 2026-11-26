@@ -11,12 +11,18 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import bikenet  # noqa: E402
 import pipeline  # noqa: E402
 import progress  # noqa: E402
 import webapp  # noqa: E402
 from synthetic import LAT0, LON0, HillElevation, grid_graph, node  # noqa: E402
 
 N = 25
+# a stand-in local bike network around the synthetic grid, so no download is needed
+TESTVILLE = bikenet.Source(
+    id="testville", name="Testville bike network", short="Testville's bike network",
+    bbox=(LON0 - 0.1, LAT0 - 0.1, LON0 + 0.1, LAT0 + 0.1), url="http://127.0.0.1:9/",
+    category_field="ovl2_cat", classes={"PCR": bikenet.PRIMARY}, attribution="Testville Council")
 
 
 class GridWorkspace(pipeline.Workspace):
@@ -29,6 +35,15 @@ class GridWorkspace(pipeline.Workspace):
         self.grids = {"run": grid_graph(N, mode="run"), "ride": grid_graph(N, mode="ride", one_way_rows=True)}
         self.delay = 0.0
 
+    def bike_network(self, source):
+        # primary cycle routes along rows 10, 12 and 14 of the grid, end to end
+        rg = self.grids["ride"]
+        lines = [[[float(rg.node_lon[node(N, i, j)]), float(rg.node_lat[node(N, i, j)])] for j in (0, N - 1)]
+                 for i in (10, 12, 14)]
+        features = [{"properties": {"ovl2_cat": "PCR"}, "geometry": {"type": "LineString", "coordinates": c}}
+                    for c in lines]
+        return bikenet.Network.from_geojson(source, {"features": features}, version="test")
+
     def graph_for(self, mode, start, end, distance_m, tolerance):
         if self.delay:
             progress.report("download", 0, 4)
@@ -39,6 +54,8 @@ class GridWorkspace(pipeline.Workspace):
 class WebAppTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.sources = list(bikenet.SOURCES)
+        bikenet.SOURCES.append(TESTVILLE)
         cls.tmp = tempfile.TemporaryDirectory()
         cls.ws = GridWorkspace(cls.tmp.name)
         cls.app = webapp.App(cls.ws, export_problem="No export in tests.")
@@ -49,6 +66,7 @@ class WebAppTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        bikenet.SOURCES[:] = cls.sources
         cls.server.shutdown()
         cls.server.server_close()
         cls.tmp.cleanup()
@@ -105,6 +123,7 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(c["usual_start"], {"ride": None, "run": None})
         self.assertEqual(c["export_problem"], "No export in tests.")
         self.assertIn("active_job", c)
+        self.assertEqual([n["id"] for n in c["bike_networks"]], ["brisbane", "testville"])
 
     def test_loop_with_alternatives_elevation_gpx_and_nearby_roads(self):
         s = self.plan(mode="ride", distance_km=6, start=self.point(12, 12), end=None,
@@ -268,6 +287,29 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(self.get_json(f"/api/saved/{item['id']}")[0], 404)
         self.assertEqual(self.request("DELETE", f"/api/saved/{item['id']}")[0], 404)
         self.assertEqual(self.request("POST", "/api/saved", {"job": "0123456789ab", "index": 0})[0], 404)
+
+    # -- the local bike network ---------------------------------------------------------
+
+    def test_bike_network_is_favoured_and_reported(self):
+        start = self.point(7, 12)
+        off, on = (self.plan(mode="ride", distance_km=6, start=start, alternatives=1, effort="quick",
+                             bike_network=e)["result"] for e in (0, 1))
+        self.assertIsNotNone(off["routes"][0]["bike_km"])  # reported even when it isn't favoured
+        self.assertGreater(on["routes"][0]["bike_pct"], off["routes"][0]["bike_pct"])
+        self.assertEqual((on["bike_network"]["id"], on["bike_network"]["emphasis"]), ("testville", 1))
+        self.assertEqual(off["bike_network"]["emphasis"], 0)
+        run = self.plan(mode="run", distance_km=5, start=start, alternatives=1, effort="quick", bike_network=1)
+        self.assertIsNone(run["result"]["bike_network"])  # it's for rides
+        self.assertIsNone(run["result"]["routes"][0]["bike_km"])
+
+    def test_bike_network_overlay(self):
+        status, data = self.get_json("/api/bike-network/testville")
+        self.assertEqual(status, 200)
+        self.assertEqual((data["attribution"], len(data["classes"]["primary"])), ("Testville Council", 3))
+        self.assertEqual(self.get_json("/api/bike-network/nowhere")[0], 404)
+        status, _, data = self.request("POST", "/api/plan", {"start": self.point(1, 1), "bike_network": 2})
+        self.assertEqual(status, 400)
+        self.assertIn("bike_network", json.loads(data)["error"])
 
     # -- input checking and safety -----------------------------------------------------
 
